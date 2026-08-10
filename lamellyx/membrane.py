@@ -175,6 +175,28 @@ def check_settings(cfg, protein=False, xy_margin=None):
     if cfg.temperature <= 0:
         out.append(("error", "temperature must be above absolute zero (%r K)"
                     % cfg.temperature))
+    # A composition naming a lipid with no conformer library builds nothing.
+    # It used to pass check() and then raise NotImplementedError a minute into
+    # build(), which defeats the point of having check() at all: it exists so a
+    # configuration can be rejected before it costs anything.
+    wanted = [str(k).upper() for k in cfg.species()]
+    if len(wanted) > 1:
+        out.append(("error",
+                    "mixed bilayers are not supported yet (asked for %s). Each "
+                    "species needs its own conformer library and interleaved "
+                    "placement -- build one lipid at a time for now."
+                    % ", ".join(sorted(wanted))))
+    elif wanted:
+        from .library import available_lipids
+        have = {l.upper() for l in available_lipids()}
+        missing = [l for l in wanted if l not in have]
+        if missing:
+            out.append(("error",
+                        "no conformer library for %s (have: %s). Build one with "
+                        "`python -m lamellyx.make_data <gromacs_dir> --lipid %s`"
+                        % (", ".join(missing),
+                           ", ".join(sorted(have)) or "none", missing[0])))
+
     if cfg.leaflet not in ("bilayer", "monolayer"):
         out.append(("error",
                     "leaflet must be 'bilayer' or 'monolayer', not %r -- an "

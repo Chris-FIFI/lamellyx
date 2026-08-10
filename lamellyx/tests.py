@@ -1564,6 +1564,28 @@ def _stub_gmx(tmpdir, topol=_STUB_TOPOL, fail=False):
 
 
 @test
+def regression_check_refuses_a_lipid_it_cannot_build():
+    """`check()` exists so a configuration can be rejected before it costs a
+    minute. A mixture used to pass it and then raise NotImplementedError deep
+    inside build(), which is the same shape as any other parameter the API
+    accepts and cannot honour."""
+    from .api import check
+
+    r = check({"x": 6.0, "y": 6.0, "composition": {"POPC": 0.7, "POPE": 0.3}})
+    assert not r["ok"], r
+    assert any("mixed bilayers" in e for e in r["errors"]), r["errors"]
+
+    r = check({"x": 6.0, "y": 6.0, "lipid": "POPE"})
+    assert not r["ok"], r
+    assert any("conformer library" in e for e in r["errors"]), r["errors"]
+    # the message must say how to fix it, not just that it is wrong
+    assert any("make_data" in e for e in r["errors"]), r["errors"]
+
+    # and the configuration that does work is still accepted
+    assert check({"x": 6.0, "y": 6.0})["ok"]
+
+
+@test
 def invariant_equilibration_schedule_is_sane():
     """Restraints only ever loosen, and the free stage is long enough to be
     worth calling equilibration."""
