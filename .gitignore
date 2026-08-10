@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Not this package's work and not clearly redistributable. See LICENSE.
+#   POPC conformers  -- coordinates lifted from an equilibrated CHARMM-GUI bilayer
+#   TIP3 cube        -- likewise
+#   toppar/*.itp     -- CHARMM36 parameters, MacKerell lab, converted by CHARMM-GUI
+# Recreate them from any CHARMM-GUI GROMACS directory you already have:
+#   python -m lamellyx setup <gromacs_dir>
+lamellyx/data/

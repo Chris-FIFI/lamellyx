@@ -1,0 +1,83 @@
+You have a Python package called lamellyx. It builds solvated lipid
+bilayer systems ready for GROMACS. It exists because CHARMM-GUI is a web form
+with no API; this does the same job as a function call.
+
+INSTALL (skip if `import lamellyx` already works):
+    pip install lamellyx-1.0.0-py3-none-any.whl
+Python 3.9+ and numpy are the only requirements. GROMACS is needed to RUN the
+output, not to build it.
+
+DISCOVER EVERYTHING -- do this first, do not guess at settings:
+    python -m lamellyx schema
+That prints every setting with its default, type, units and constraints.
+
+USE IT -- plain dicts in, plain dicts out:
+    from lamellyx.api import describe, check, build
+    check({"n_upper": 100, "n_lower": 100, "area_per_lipid": 0})
+    build({"output_dir": "popc_box", "n_upper": 100, "n_lower": 100,
+           "area_per_lipid": 0})
+
+Or from a shell, JSON on stdout:
+    python -m lamellyx check --set n_upper=100 --json
+    python -m lamellyx build --out popc_box --set n_upper=100 --json
+
+ALWAYS call check() before build(). It is instant and catches settings that
+GROMACS would reject, instead of spending a minute producing them.
+
+UNITS -- nanometres throughout this API:
+    x, y                 FULL box edge. Not a half-width. Not a margin.
+    margin_x, margin_y   nm of lipid beyond the protein, on EACH side
+    water_thickness      nm above AND below the bilayer
+    salt_concentration   mol/L
+    area_per_lipid       nm^2 per lipid, per leaflet
+
+THREE THINGS THAT STOP A BUILD:
+
+1. area_per_lipid ships at 0.15 nm^2 and is REFUSED. Two extended acyl chains
+   occupy about 0.40 nm^2, so 0.15 has nowhere to put them. Pass
+   area_per_lipid: 0 to use the measured value for the lipid (0.643 nm^2 for
+   POPC), which is what CHARMM-GUI does -- it has no such field.
+
+2. A box below 2.4 nm is refused. CHARMM36 uses 1.2 nm cutoffs and a periodic
+   box must be at least twice its cutoff for the minimum image convention.
+
+3. size_mode decides which fields are even read:
+       "lipid_numbers"   (default) n_upper/n_lower in, box size out
+       "box"             x and y in, lipid counts out
+       "protein_margin"  needs a protein; box = protein width + margin each side
+   Setting x while in lipid_numbers mode does nothing. It warns rather than
+   pretending.
+
+JUDGING THE RESULT -- build() returns these; check them:
+    net_charge                     must be exactly 0.0
+    closest_heavy_atom_contact_A   above ~2.2 (CHARMM-GUI's own is 2.34)
+    density_g_cm3                  0.90 to 0.98 for a solvated bilayer
+    heavy_pairs_below_2.4A         single digits is normal, hundreds is not
+
+Then, on a machine with GROMACS:
+    gmx grompp -f step6.0_minimization.mdp -c step5_input.gro \
+               -r step5_input.gro -p topol.top -n index.ndx -o min.tpr
+    gmx mdrun -deffnm min
+Run the minimisation before anything else. Rigid-conformer packing cannot open
+a sub-Angstrom hydrogen contact -- only a torsion change can, and that is what
+minimisation does.
+
+DEFAULTS: POPC bilayer, 0.5 M KCl (POT/CLA), CHARMM36, TIP3P, 1.5 nm water
+above and below, 2.0 nm lipid margin each side of a protein, 310 K.
+
+EMBEDDING A PROTEIN: use build_protein_system(). Same units (nm) and same
+names as build(). It needs reference_dir -- a directory holding that protein's
+own .itp files; force-field parameters cannot be generated, so a sequence goes
+through CHARMM-GUI or pdb2gmx once, after which any conformation of it builds
+from a script.
+
+The protein PDB must match the topology: original residue numbering and a
+chain identifier in column 22. Do NOT hand-extract it from the reference .gro
+-- .gro has no chain column and renumbers residues from 1. Use:
+    python -m lamellyx extract-protein <reference_dir> protein.pdb
+
+LIMITS: the bundled parameters cover POPC, TIP3P, K+ and Cl- only. Mixed-lipid
+bilayers are not implemented and say so. seed makes a build reproducible, and
+every build writes build_report.json with the full configuration.
+
+Full detail is in AGENTS.md inside the package.

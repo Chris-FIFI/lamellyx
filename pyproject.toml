@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lamellyx"
+version = "1.0.0"
+description = "Scriptable lipid bilayer and membrane-protein systems for GROMACS -- a Python API where CHARMM-GUI offers only a web form."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "CJ" }]
+keywords = ["molecular dynamics", "gromacs", "membrane", "bilayer",
+            "lipid", "charmm36", "structural biology"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Intended Audience :: Science/Research",
+]
+dependencies = ["numpy>=1.20"]
+
+[project.urls]
+Documentation = "https://github.com/USER/lamellyx#readme"
+
+[project.scripts]
+lamellyx = "lamellyx.__main__:main"
+
+[tool.setuptools]
+packages = ["lamellyx"]
+# Must be explicit: it defaults to true for pyproject-based builds, and with
+# it on, data/ went into the wheel regardless of package-data below.
+include-package-data = false
+
+[tool.setuptools.package-data]
+# data/ is deliberately NOT packaged -- it is CHARMM-GUI / MacKerell material
+# with no stated redistribution terms. See LICENSE. Users run
+# `python -m lamellyx setup <gromacs_dir>` once, against a CHARMM-GUI
+# directory they already have.
+lamellyx = ["*.md"]
