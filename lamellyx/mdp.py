@@ -64,13 +64,20 @@ comm_grps               = MEMB SOLV
 """
 
 # (name, bb, sc, lipid, dihres, dt, nsteps, barostat, gen_vel)
+#
+# The final stage is 5 ns rather than CHARMM-GUI's 0.5 ns. It is the only stage
+# where the lipids and side chains are completely free -- every restraint above
+# backbone 50 kJ/mol/nm^2 has been released -- so it is the only one where the
+# bilayer can actually relax to its own area per lipid and thickness. Half a
+# nanosecond is not long enough to see that happen, which means the state
+# production inherits has never been shown to be settled.
 _SCHEDULE = [
     ("step6.1_equilibration", 4000.0, 2000.0, 1000.0, 1000.0, 0.001, 125000, False, True),
     ("step6.2_equilibration", 2000.0, 1000.0, 400.0, 400.0, 0.001, 125000, False, False),
     ("step6.3_equilibration", 1000.0, 500.0, 400.0, 200.0, 0.001, 125000, True, False),
     ("step6.4_equilibration", 500.0, 200.0, 200.0, 200.0, 0.002, 250000, True, False),
     ("step6.5_equilibration", 200.0, 50.0, 40.0, 100.0, 0.002, 250000, True, False),
-    ("step6.6_equilibration", 50.0, 0.0, 0.0, 0.0, 0.002, 250000, True, False),
+    ("step6.6_equilibration", 50.0, 0.0, 0.0, 0.0, 0.002, 2500000, True, False),
 ]
 
 MDP_FILES = (["step6.0_minimization.mdp"]

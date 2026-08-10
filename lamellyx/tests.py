@@ -1564,6 +1564,36 @@ def _stub_gmx(tmpdir, topol=_STUB_TOPOL, fail=False):
 
 
 @test
+def invariant_equilibration_schedule_is_sane():
+    """Restraints only ever loosen, and the free stage is long enough to be
+    worth calling equilibration."""
+    prev = None
+    for name, bb, sc, lip, dih, dt, nsteps, baro, gv in mdp._SCHEDULE:
+        if prev is not None:
+            for a, b, what in ((bb, prev[0], "backbone"), (sc, prev[1], "sidechain"),
+                               (lip, prev[2], "lipid"), (dih, prev[3], "dihedral")):
+                assert a <= b, "%s restraint rises at %s: %g > %g" % (
+                    what, name, a, b)
+        prev = (bb, sc, lip, dih)
+
+    # (name, bb, sc, lipid, dihres, dt, nsteps, barostat, gen_vel)
+    last = mdp._SCHEDULE[-1]
+    ns = last[6] * last[5] / 1000.0
+    assert last[1] > 0.0, "the final stage should still restrain the backbone"
+    assert last[2] == last[3] == last[4] == 0.0, \
+        "side chains, lipids and dihedrals must all be free by the final "\
+        "stage, or the bilayer cannot relax: %r" % (last,)
+    # 0.5 ns -- CHARMM-GUI's default -- is too short for the bilayer to reach
+    # its own area per lipid in the only stage where it is free to.
+    assert ns >= 5.0, "final equilibration is %.2f ns, too short" % ns
+
+    only_first_generates = [s[8] for s in mdp._SCHEDULE]
+    assert only_first_generates[0] is True, "step6.1 must generate velocities"
+    assert not any(only_first_generates[1:]), \
+        "only the first stage should generate velocities"
+
+
+@test
 def regression_missing_data_points_at_the_setup_command():
     """The published repository ships no data/ -- it is CHARMM-GUI and
     MacKerell material with no stated redistribution terms. A fresh clone must

@@ -21,7 +21,9 @@ classifiers = [
 dependencies = ["numpy>=1.20"]
 
 [project.urls]
-Documentation = "https://github.com/USER/lamellyx#readme"
+Homepage = "https://github.com/Chris-FIFI/lamellyx"
+Documentation = "https://github.com/Chris-FIFI/lamellyx#readme"
+Issues = "https://github.com/Chris-FIFI/lamellyx/issues"
 
 [project.scripts]
 lamellyx = "lamellyx.__main__:main"
