@@ -5,8 +5,13 @@ language model. Everything here takes and returns plain JSON.
 
 ## Install
 
+Not on PyPI — it is a private GitHub repo, so `pip install lamellyx` fails.
+Install from a clone:
+
 ```bash
-pip install lamellyx
+git clone https://github.com/Chris-FIFI/lamellyx.git
+cd lamellyx
+pip install -e .
 python -m lamellyx setup <a CHARMM-GUI gromacs directory>
 ```
 

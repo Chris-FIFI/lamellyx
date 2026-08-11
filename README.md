@@ -37,10 +37,25 @@ gmx mdrun -deffnm min
 
 ## Install
 
+**This is not on PyPI — `pip install lamellyx` will fail.** It is a private
+GitHub repository. Clone it and install from the clone:
+
 ```bash
-pip install lamellyx
+git clone https://github.com/Chris-FIFI/lamellyx.git
+cd lamellyx
+pip install -e .
 python -m lamellyx setup <a CHARMM-GUI gromacs directory>
 ```
+
+`-e` installs it editable, so a `git pull` updates the package with no
+reinstall — drop the `-e` for a plain install. If you already have the files
+(e.g. from an archive), skip the clone and run `pip install -e .` from inside
+the folder.
+
+> If pip warns that `lamellyx.exe` is not on PATH, ignore it and use
+> **`python -m lamellyx …`** instead of the bare `lamellyx` command — it always
+> works regardless of PATH. Every `lamellyx <cmd>` below can be written
+> `python -m lamellyx <cmd>`.
 
 Python 3.9+ and numpy; nothing else. GROMACS is needed to *run* the result, not
 to build it — and to generate protein topology, which is the one step that
