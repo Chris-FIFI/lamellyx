@@ -553,7 +553,7 @@ def build_membrane(cfg):
     res.stats["output_bytes"] = topology.directory_size(cfg.output_dir)
 
     p = os.path.join(cfg.output_dir, "build_report.json")
-    with open(p, "w") as fh:
+    with open(p, "w", newline="\n") as fh:
         json.dump({"config": asdict(cfg), "counts": res.counts,
                    "box_nm": list(res.box_nm), "warnings": res.warnings,
                    "stats": _jsonable(res.stats)}, fh, indent=2)

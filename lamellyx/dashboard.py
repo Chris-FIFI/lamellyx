@@ -65,8 +65,8 @@ SECURITY_HEADERS = {
 # The page is one self-contained file with inline style and script and no
 # external resources at all, so everything else can be denied outright.
 CSP = ("default-src 'none'; script-src 'unsafe-inline'; "
-       "style-src 'unsafe-inline'; connect-src 'self'; form-action 'none'; "
-       "base-uri 'none'; frame-ancestors 'none'")
+       "style-src 'unsafe-inline'; img-src data:; connect-src 'self'; "
+       "form-action 'none'; base-uri 'none'; frame-ancestors 'none'")
 
 
 def safe_upload_name(name):
@@ -86,6 +86,19 @@ def looks_like_structure(data):
     head = data[:200_000]
     return any(k in head for k in (b"ATOM  ", b"HETATM", b"CRYST1")) or \
         (data[:2048].count(b"\n") > 1 and b"." in data[:2048])
+
+
+def _str_field(raw, key):
+    """A string field from a request body: '' when absent or null, the string
+    itself when present, or ValueError when it is some other JSON type -- so a
+    number or list where a string was expected is a clean 400, not a 500 from a
+    later .strip()."""
+    v = raw.get(key)
+    if v is None:
+        return ""
+    if not isinstance(v, str):
+        raise ValueError("field %r must be a string" % key)
+    return v
 
 
 # --------------------------------------------------------------------------
@@ -297,6 +310,16 @@ class Handler(BaseHTTPRequestHandler):
             raise _TooLarge("body is %d bytes, the limit is %d" % (n, limit))
         return self.rfile.read(n) if n else b""
 
+    def _json_obj(self):
+        """The request body as a JSON object. A body that is valid JSON but not
+        an object (a list, number, string, null) is a client mistake, so it is a
+        ValueError -> 400, not an AttributeError deep in a handler -> 500."""
+        data = json.loads(self._body())
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object, got %s"
+                             % type(data).__name__)
+        return data
+
     # -- access control ----------------------------------------------------
 
     def _reject(self):
@@ -333,6 +356,22 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("path outside the workspace")
         return p
 
+    # The base force-field directory a real ParamChem stream needs is a long
+    # path to type; remember the last one used so the Ligand tab can pre-fill it.
+    def _read_last_ff(self):
+        try:
+            with open(os.path.join(self.workspace, ".last_cgenff_ff")) as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+
+    def _save_last_ff(self, ff):
+        try:
+            with open(os.path.join(self.workspace, ".last_cgenff_ff"), "w") as fh:
+                fh.write(ff)
+        except OSError:
+            pass
+
     # -- routes ------------------------------------------------------------
 
     def do_GET(self):
@@ -361,6 +400,7 @@ class Handler(BaseHTTPRequestHandler):
                     "workspace_bytes": topology.directory_size(self.workspace)
                     if os.path.isdir(self.workspace) else 0,
                     "history": _history(self.workspace),
+                    "last_cgenff_ff": self._read_last_ff(),
                 })
             if u.path.startswith("/api/job/"):
                 jid = u.path.rsplit("/", 1)[-1]
@@ -410,7 +450,7 @@ class Handler(BaseHTTPRequestHandler):
                 # The page also carries protein settings, which belong to a
                 # different config; keep only what MembraneConfig knows.
                 known = {f.name for f in fields(MembraneConfig)}
-                raw = json.loads(self._body())
+                raw = self._json_obj()
                 cfg = MembraneConfig(**{k: v for k, v in raw.items()
                                         if k in known})
                 issues = check_settings(
@@ -420,9 +460,12 @@ class Handler(BaseHTTPRequestHandler):
                     {"level": l, "message": m} for l, m in issues]})
 
             if u.path == "/api/upload":
+                # Read the (bounded) body before validating the name, so a
+                # rejected upload still consumes the request and the client gets
+                # a clean 400 rather than a reset connection mid-send.
+                data = self._body(MAX_UPLOAD)
                 name = safe_upload_name(
                     parse_qs(u.query).get("name", ["protein.pdb"])[0])
-                data = self._body(MAX_UPLOAD)
                 if not data:
                     return self._send(400, {"error": "empty upload"})
                 if not looks_like_structure(data):
@@ -438,7 +481,7 @@ class Handler(BaseHTTPRequestHandler):
                                         "bytes": os.path.getsize(p)})
 
             if u.path == "/api/build":
-                cfg = json.loads(self._body())
+                cfg = self._json_obj()
                 cfg.pop("output_dir", None)
                 jid = time.strftime("%Y%m%d-%H%M%S")
                 if jid in _jobs:
@@ -451,9 +494,45 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"job": jid})
 
             if u.path == "/api/delete":
-                jid = os.path.basename(json.loads(self._body())["id"])
-                shutil.rmtree(self._safe(jid), ignore_errors=True)
+                jid = _str_field(self._json_obj(), "id")
+                if not jid:
+                    return self._send(400, {"error": "delete needs an 'id'"})
+                shutil.rmtree(self._safe(os.path.basename(jid)),
+                              ignore_errors=True)
                 return self._send(200, {"ok": True})
+
+            if u.path == "/api/ligand":
+                # v2's ligand function: a CGenFF .str -> GROMACS .itp. Runs the
+                # same tested converter build_membrane never touches; writes into
+                # the workspace so the files download through /api/file like a
+                # build's do.
+                from . import cgenff as _cg
+                raw = self._json_obj()
+                text = _str_field(raw, "str_text").strip()
+                if not text:
+                    return self._send(400, {"error": "paste a CGenFF .str first"})
+                resname = _str_field(raw, "resname").strip() or None
+                ff = _str_field(raw, "cgenff_ff").strip() or None
+                pf = raw.get("penalty_flag")
+                pf = float(pf) if pf not in (None, "", False) else None
+                out = self._safe("ligands")
+                os.makedirs(out, exist_ok=True)
+                try:
+                    rep = _cg.generate_ligand_topology(
+                        text, out, resname=resname, cgenff_ff=ff,
+                        penalty_flag=pf)
+                except (ValueError, FileNotFoundError) as exc:
+                    return self._send(400, {"error": str(exc)})
+                if ff:
+                    self._save_last_ff(ff)     # remember it to pre-fill next time
+                # include the .itp text so the page can show it inline, not only
+                # offer a download (ligand topologies are small)
+                try:
+                    with open(rep["itp"]) as fh:
+                        rep["itp_text"] = fh.read()
+                except OSError:
+                    pass
+                return self._send(200, rep)
 
             return self._send(404, {"error": "not found"})
         except _TooLarge as exc:
@@ -488,12 +567,15 @@ PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Lamellyx</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA0MCA0MCIgd2lkdGg9IjQwIiBoZWlnaHQ9IjQwIj48cmVjdCB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHJ4PSIxMSIgZmlsbD0iIzFmNmY1YyIvPjxnIGZpbGw9IiNmZmYiPjxjaXJjbGUgY3g9IjEyIiBjeT0iMTIiIHI9IjIuNyIvPjxjaXJjbGUgY3g9IjIwIiBjeT0iMTIiIHI9IjIuNyIvPjxjaXJjbGUgY3g9IjI4IiBjeT0iMTIiIHI9IjIuNyIvPjxjaXJjbGUgY3g9IjEyIiBjeT0iMjgiIHI9IjIuNyIvPjxjaXJjbGUgY3g9IjIwIiBjeT0iMjgiIHI9IjIuNyIvPjxjaXJjbGUgY3g9IjI4IiBjeT0iMjgiIHI9IjIuNyIvPjwvZz48ZyBmaWxsPSIjZmZmIiBvcGFjaXR5PSIuNzgiPjxyZWN0IHg9IjExIiB5PSIxNC43IiB3aWR0aD0iMiIgaGVpZ2h0PSI0LjMiIHJ4PSIxIi8+PHJlY3QgeD0iMTkiIHk9IjE0LjciIHdpZHRoPSIyIiBoZWlnaHQ9IjQuMyIgcng9IjEiLz48cmVjdCB4PSIyNyIgeT0iMTQuNyIgd2lkdGg9IjIiIGhlaWdodD0iNC4zIiByeD0iMSIvPjxyZWN0IHg9IjExIiB5PSIyMSIgd2lkdGg9IjIiIGhlaWdodD0iNC4zIiByeD0iMSIvPjxyZWN0IHg9IjE5IiB5PSIyMSIgd2lkdGg9IjIiIGhlaWdodD0iNC4zIiByeD0iMSIvPjxyZWN0IHg9IjI3IiB5PSIyMSIgd2lkdGg9IjIiIGhlaWdodD0iNC4zIiByeD0iMSIvPjwvZz48L3N2Zz4=">
 <style>
 :root{--bg:#fbfbfa;--fg:#1a1a18;--mut:#6b6b66;--line:#e2e1dd;--card:#fff;
 --acc:#1f6f5c;--warn:#8a6100;--err:#a32d22;--ok:#1f6f5c;--mono:ui-monospace,
 "SF Mono",Menlo,Consolas,monospace}
-@media(prefers-color-scheme:dark){:root{--bg:#16171a;--fg:#e8e8e4;--mut:#9a9a94;
---line:#2c2e33;--card:#1d1f23;--acc:#5fbfa3;--warn:#d9a441;--err:#e5796b;--ok:#5fbfa3}}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#16171a;--fg:#e8e8e4;
+--mut:#9a9a94;--line:#2c2e33;--card:#1d1f23;--acc:#5fbfa3;--warn:#d9a441;--err:#e5796b;--ok:#5fbfa3}}
+:root[data-theme="dark"]{--bg:#16171a;--fg:#e8e8e4;--mut:#9a9a94;--line:#2c2e33;
+--card:#1d1f23;--acc:#5fbfa3;--warn:#d9a441;--err:#e5796b;--ok:#5fbfa3}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,
 -apple-system,Segoe UI,sans-serif}
@@ -544,13 +626,85 @@ font-weight:600;letter-spacing:.03em}
 a{color:var(--acc)}
 details summary{cursor:pointer;font-size:12px;color:var(--mut);
 text-transform:uppercase;letter-spacing:.07em;font-weight:600}
-</style></head><body>
+nav.tabs{display:flex;gap:4px;margin-top:14px}
+nav.tabs .tab{background:transparent;color:var(--mut);border:1px solid transparent;
+font-weight:600;font-size:13px;padding:8px 15px;border-radius:8px 8px 0 0;
+margin-bottom:-1px;cursor:pointer}
+nav.tabs .tab.active{color:var(--fg);background:var(--card);border-color:var(--line);
+border-bottom-color:var(--card)}
+textarea{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:6px;
+background:var(--bg);color:var(--fg);font:12.5px/1.5 var(--mono);resize:vertical}
+textarea:focus{outline:2px solid var(--acc);outline-offset:-1px}
+/* brand lockup */
+.brand{display:flex;align-items:center;gap:13px}
+.logo{color:var(--acc);display:inline-flex;flex:none;line-height:0;
+box-shadow:0 1px 3px rgba(0,0,0,.14);border-radius:9px}
+.logo svg{display:block;border-radius:9px}
+.logo img{height:34px;width:auto;display:block;border-radius:9px}/* your PNG lands here */
+.headtop{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+.themetoggle{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:12px;
+font-weight:600;color:var(--mut);background:transparent;border:1px solid var(--line);
+border-radius:8px;padding:6px 10px;cursor:pointer;flex:none}
+.themetoggle:hover{color:var(--fg);border-color:var(--acc)}
+.themetoggle svg{width:15px;height:15px;display:block;flex:none}
+/* micro-interactions -- nothing snapped instantly before */
+button{transition:filter .15s ease,transform .06s ease,box-shadow .15s ease,
+border-color .15s ease,color .15s ease,background .15s ease}
+button:not(.ghost){box-shadow:0 1px 2px rgba(0,0,0,.10)}
+button:hover:not(:disabled){filter:brightness(1.07)}
+button:active:not(:disabled){transform:translateY(1px)}
+button.ghost:hover:not(:disabled){border-color:var(--acc);color:var(--acc)}
+.card{box-shadow:0 1px 3px rgba(20,20,18,.045);transition:border-color .15s ease,
+box-shadow .15s ease}
+nav.tabs .tab{transition:color .15s ease,background .15s ease,border-color .15s ease}
+nav.tabs .tab:hover:not(.active){color:var(--fg)}
+input,select,textarea{transition:border-color .12s ease,box-shadow .12s ease}
+#drop{transition:border-color .15s ease,background .15s ease,color .15s ease}
+#drop:hover{border-color:var(--acc);color:var(--fg)}
+a{transition:color .12s ease}
+a:hover{text-decoration:underline}
+/* refinement: keyboard focus rings, reading measure, branded selection */
+button:focus-visible,nav.tabs .tab:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+header p{max-width:60ch}
+::selection{background:color-mix(in srgb,var(--acc) 28%,transparent)}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+<script>/* apply saved theme before first paint, so there is no flash of the wrong one */
+(function(){try{var t=localStorage.getItem('lamellyx-theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);}catch(e){}})();
+</script>
+</head><body>
 <header>
-  <h1>Lamellyx</h1>
-  <p>Packs a bilayer, solvates it, adds salt, and writes a directory GROMACS can run.
-     Optionally embeds a protein.</p>
+  <div class="headtop">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"><!-- lamellyx mark: a lipid bilayer. Inherits --acc via currentColor. -->
+      <svg width="36" height="36" viewBox="0 0 40 40" role="img" aria-label="Lamellyx">
+        <rect width="40" height="40" rx="11" fill="currentColor"/>
+        <g fill="#fff">
+          <circle cx="12" cy="12" r="2.7"/><circle cx="20" cy="12" r="2.7"/><circle cx="28" cy="12" r="2.7"/>
+          <circle cx="12" cy="28" r="2.7"/><circle cx="20" cy="28" r="2.7"/><circle cx="28" cy="28" r="2.7"/>
+        </g>
+        <g fill="#fff" opacity=".78">
+          <rect x="11" y="14.7" width="2" height="4.3" rx="1"/><rect x="19" y="14.7" width="2" height="4.3" rx="1"/><rect x="27" y="14.7" width="2" height="4.3" rx="1"/>
+          <rect x="11" y="21" width="2" height="4.3" rx="1"/><rect x="19" y="21" width="2" height="4.3" rx="1"/><rect x="27" y="21" width="2" height="4.3" rx="1"/>
+        </g>
+      </svg>
+    </span>
+    <div>
+      <h1>Lamellyx</h1>
+      <p>Build a membrane system GROMACS can run, or turn a CGenFF stream into a
+         ligand topology.</p>
+    </div>
+  </div>
+  <button type="button" id="themetoggle" class="themetoggle" aria-label="Toggle theme">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 010 18z" fill="currentColor" stroke="none"/></svg><span class="lbl">Auto</span>
+  </button>
+  </div>
+  <nav class="tabs">
+    <button type="button" class="tab active" data-tab="membrane">Membrane builder</button>
+    <button type="button" class="tab" data-tab="ligand">Ligand topology</button>
+  </nav>
 </header>
-<div class="wrap">
+<div class="wrap" id="tab-membrane">
  <div>
   <div class="card">
     <h2>Protein <span style="text-transform:none;font-weight:400">(optional)</span></h2>
@@ -678,8 +832,75 @@ text-transform:uppercase;letter-spacing:.07em;font-weight:600}
   </div>
  </div>
 </div>
+
+<div class="wrap" id="tab-ligand" style="display:none">
+ <div>
+  <div class="card">
+    <h2>CGenFF stream</h2>
+    <label>Paste the .str <span class="hint">from ParamChem (cgenff.silcsbio.com) or hand-built</span></label>
+    <textarea id="lig_str" rows="15" spellcheck="false"
+      placeholder="* Toppar stream file ...&#10;&#10;read rtf card append&#10;...&#10;&#10;read param card flex append&#10;...&#10;END"></textarea>
+    <div class="hint" style="margin-top:7px">A real ParamChem stream is only a
+      <em>supplement</em> to the base force field. Give the toppar directory
+      below and its standard bonds, angles and Lennard-Jones terms are merged in.</div>
+  </div>
+  <div class="card">
+    <h2>Options</h2>
+    <label>Residue name <span class="hint">optional — overrides the RESI in the stream</span></label>
+    <input id="lig_resname" placeholder="from the stream">
+    <label>Base force-field directory
+      <span class="hint">a toppar/ with top_all36_cgenff.rtf + par_all36_cgenff.prm</span></label>
+    <input id="lig_ff" placeholder="optional; needed for a real ParamChem stream">
+    <label>Flag penalties above
+      <span class="hint">optional; penalties are always reported, never refused</span></label>
+    <input id="lig_penalty" type="number" step="1" min="0" placeholder="e.g. 50">
+  </div>
+  <button id="lig_go" style="width:100%">Make topology</button>
+ </div>
+ <div>
+  <div class="card" id="lig_resultcard" style="display:none">
+    <h2>Result</h2><div id="lig_result"></div></div>
+  <div class="card">
+    <h2>How this fits</h2>
+    <div class="hint" style="line-height:1.65">
+      <b>No CGenFF licence?</b> Draw or upload your molecule at
+      <span class="mono">cgenff.silcsbio.com</span>, download the
+      <span class="mono">.str</span>, and paste it here. To start from a PDB,
+      run <span class="mono">lamellyx mol2 lig.pdb lig.mol2</span> first (it
+      protonates at pH 7), upload that mol2, then paste the stream back.
+      <br><br>You get <span class="mono">&lt;RESN&gt;.itp</span> and
+      <span class="mono">&lt;RESN&gt;_atomtypes.itp</span>: #include the
+      atomtypes before any <span class="mono">[ moleculetype ]</span>, the
+      .itp after. Not yet checked by <span class="mono">gmx grompp</span>.
+    </div>
+  </div>
+ </div>
+</div>
 <script>
 const $=id=>document.getElementById(id);
+
+// theme toggle: cycle Auto -> Light -> Dark, remembered in localStorage.
+// Auto follows the OS; Light/Dark override it via a data-theme attribute.
+(function(){
+ const order=['auto','light','dark'];
+ const ic={
+  auto:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 010 18z" fill="currentColor" stroke="none"/></svg>',
+  light:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></svg>',
+  dark:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg>'
+ };
+ const lab={auto:'Auto',light:'Light',dark:'Dark'};
+ const btn=$('themetoggle'); if(!btn)return;
+ const get=()=>{try{const t=localStorage.getItem('lamellyx-theme');return (t==='light'||t==='dark')?t:'auto';}catch(e){return 'auto';}};
+ const apply=s=>{
+  if(s==='auto')document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme',s);
+  btn.innerHTML=ic[s]+'<span class="lbl">'+lab[s]+'</span>';
+  btn.setAttribute('aria-label','Theme: '+lab[s]+' (click to change)');
+  btn.title='Theme: '+lab[s];
+ };
+ let cur=get(); apply(cur);
+ btn.addEventListener('click',()=>{cur=order[(order.indexOf(cur)+1)%3];try{cur==='auto'?localStorage.removeItem('lamellyx-theme'):localStorage.setItem('lamellyx-theme',cur);}catch(e){} apply(cur);});
+})();
 
 // The token arrives in the URL, is kept in memory, and is scrubbed from the
 // address bar straight away so it does not end up in history or a screenshot.
@@ -736,10 +957,12 @@ async function load(){
  sel.value=d.lipid;
  $("wspath").textContent="Workspace: "+STATE.workspace;
  $("wsbytes").textContent="— "+bytes(STATE.workspace_bytes)+" total";
- history(); check();
+ // pre-fill the ligand tab's force-field path with the last one used
+ if(STATE.last_cgenff_ff && !$("lig_ff").value) $("lig_ff").value=STATE.last_cgenff_ff;
+ renderHistory(); check();
 }
 
-function history(){
+function renderHistory(){
  const h=STATE.history||[];
  if(!h.length){$("history").innerHTML='<div class="hint">Nothing built yet.</div>';return}
  let t='<table><tr><th>Build</th><th>System</th><th class="num">Size</th><th></th></tr>';
@@ -881,7 +1104,7 @@ async function poll(job,since){
  if(r.status==="done"||r.status==="failed"){
   $("go").disabled=false;
   if(r.status==="done")showResult(job,r.result); else showError(r);
-  STATE=await apiJSON("/api/state"); history();
+  STATE=await apiJSON("/api/state"); renderHistory();
   $("wsbytes").textContent="— "+bytes(STATE.workspace_bytes)+" total";
   return;
  }
@@ -927,6 +1150,61 @@ async function dl(job,f){
  a.href=URL.createObjectURL(b); a.download=f; a.click();
  setTimeout(()=>URL.revokeObjectURL(a.href),5000);
 }
+// --- tabs ---
+document.querySelectorAll("nav.tabs .tab").forEach(b=>{
+ b.onclick=()=>{
+  document.querySelectorAll("nav.tabs .tab").forEach(x=>x.classList.remove("active"));
+  b.classList.add("active");
+  $("tab-membrane").style.display = b.dataset.tab==="membrane"?"":"none";
+  $("tab-ligand").style.display   = b.dataset.tab==="ligand"?"":"none";
+ };
+});
+
+// --- ligand topology ---
+$("lig_go").onclick=async()=>{
+ const text=$("lig_str").value.trim();
+ if(!text){alert("Paste a CGenFF .str first.");return}
+ $("lig_go").disabled=true;
+ const body={str_text:text, resname:$("lig_resname").value.trim(),
+   cgenff_ff:$("lig_ff").value.trim(), penalty_flag:$("lig_penalty").value};
+ try{
+  const rep=await apiJSON("/api/ligand",{method:"POST",body:JSON.stringify(body)});
+  showLigand(rep);
+ }catch(e){
+  $("lig_resultcard").style.display="block";
+  $("lig_result").innerHTML='<span class="pill failed">failed</span><p>'+esc(e.message)+"</p>";
+ }
+ $("lig_go").disabled=false;
+};
+
+function showLigand(r){
+ $("lig_resultcard").style.display="block";
+ const pen=(r.penalties||[]).map(p=>
+   `<tr><td>${esc(p[0])}</td><td class="num">${esc(p[1])}</td></tr>`).join("");
+ const files=(r.files||[]).map(f=>
+   `<a href="#" onclick="dl('ligands','${esc(f)}');return false">${esc(f)}</a>`).join(" · ");
+ $("lig_result").innerHTML=`<span class="pill done">done</span>
+  <table style="margin-top:10px">
+   <tr><td>residue</td><td class="num">${esc(r.resname)}</td></tr>
+   <tr><td>atoms</td><td class="num">${esc(r.n_atoms)}</td></tr>
+   <tr><td>net charge</td><td class="num">${Number(r.net_charge).toFixed(3)}</td></tr>
+   <tr><td>bonds / angles / dihedrals</td><td class="num">${esc(r.n_bonds)} / ${esc(r.n_angles)} / ${esc(r.n_dihedrals)}</td></tr>
+   <tr><td>impropers / lone pairs</td><td class="num">${esc(r.n_impropers)} / ${esc(r.n_lonepairs)}</td></tr>
+   <tr><td>base force field merged</td><td class="num">${r.base_ff_merged?"yes":"no"}</td></tr>
+   <tr><td>worst penalty</td><td class="num">${esc(r.worst_penalty)}</td></tr>
+  </table>
+  ${r.charge_note?`<p class="hint" style="color:var(--warn);margin-top:8px">⚠ ${esc(r.charge_note)}</p>`:""}
+  ${pen?`<details style="margin-top:10px"><summary>Penalties (${(r.penalties||[]).length})</summary>
+    <table style="margin-top:8px"><tr><th>parameter</th><th class="num">penalty</th></tr>${pen}</table></details>`:""}
+  ${r.itp_text?`<details style="margin-top:10px"><summary>View ${esc(r.resname)}.itp</summary>
+    <pre class="mono" style="max-height:40vh;overflow:auto;background:var(--bg);
+     border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:8px;
+     white-space:pre;font-size:11.5px">${esc(r.itp_text)}</pre></details>`:""}
+  <p style="font-size:12.5px;margin-top:10px">${files}</p>
+  <p class="hint">#include the _atomtypes.itp before any [ moleculetype ], the .itp
+   after. Not yet checked by gmx grompp.</p>`;
+}
+
 boxMode();
 load();
 </script></body></html>

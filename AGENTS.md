@@ -199,6 +199,41 @@ what `pdb2gmx` and CHARMM-GUI are for, and a third implementation's failure
 mode is silently wrong energies. What this removes is the *dependency on
 CHARMM-GUI* for the step.
 
+## Ligand topology
+
+The same idea for a small molecule: CGenFF assigns the parameters, this converts
+its stream to a GROMACS `.itp`.
+
+```python
+from lamellyx.api import generate_ligand_topology
+generate_ligand_topology({
+    "str": "drug.str",              # from cgenff.silcsbio.com (no licence)
+    "output_dir": "lig_out",
+    "cgenff_ff": "charmm-gui-1234/gromacs/toppar",   # REQUIRED for a real .str
+})
+```
+
+The one failure mode to know: **a real ParamChem `.str` is a supplement, not a
+complete parameter set.** Without `cgenff_ff` pointing at a `toppar/` (with
+`top_all36_cgenff.rtf` + `par_all36_cgenff.prm`) the call raises `N of this
+molecule's parameters are not in the .str` and tells you to pass it. It is not
+a bad stream; the base terms simply live in the force field the stream
+references. The report carries `net_charge`, the term counts, `worst_penalty`
+and the worst offenders. The CGenFF **penalty is reported, never refused**.
+
+Other entry points, same report shape: `{"molecule": "drug.mol2", ...}` drives
+the licensed `cgenff` binary (needs `"cgenff": "/path"`); `{"pdb": "drug.pdb",
+"ph": 7.0, ...}` protonates with Open Babel first. `prepare_mol2({"pdb": ...,
+"output": "drug.mol2"})` does only the PDB→mol2 step for the no-licence web
+route. `place_ligand({"system_dir": ..., "ligand_pdb": ..., "ligand_itp": ...,
+"output_dir": ...})` puts a positioned ligand into a built system.
+`check_system({"system_dir": ...})` structurally checks any built system before
+grompp -- [ molecules ] vs coordinate atom counts, molecule topologies, index
+coverage, net charge -- returning {ok, errors, warnings}.
+
+Like everything else here, **not yet through `gmx grompp`** — the checks are
+bookkeeping and geometry.
+
 ## Orienting a protein in the membrane
 
 A PDB whose membrane normal is not z used to get a bilayer built straight

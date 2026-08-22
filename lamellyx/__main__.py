@@ -6,6 +6,10 @@
     lamellyx build    --out popc_box   build one
     lamellyx orient   in.pdb out.pdb   put a protein in the membrane frame
     lamellyx topology in.pdb out_dir   make its .itp files via gmx pdb2gmx
+    lamellyx mol2     lig.pdb lig.mol2 protonate a PDB at pH 7 -> mol2 (no lic.)
+    lamellyx ligand   lig.str out_dir  ligand topology from a CGenFF stream
+    lamellyx place    sys lig.pdb lig.itp out   put a ligand into a system
+    lamellyx check-system  a_built_dir    sanity-check a system before grompp
     lamellyx dashboard                 open the browser UI
     lamellyx lipids                    which lipids are available
     lamellyx test                      run the test suite
@@ -124,6 +128,75 @@ def main(argv=None):
     t.add_argument("--water", default="tip3p")
     t.add_argument("--gmx", help="path to gmx, if it is not on PATH")
 
+    g = sub.add_parser("ligand",
+                       help="make a ligand's GROMACS topology from CGenFF: a "
+                            ".str from ParamChem (no licence), a .mol2/.sdf via "
+                            "the licensed cgenff binary, or a .pdb (protonated "
+                            "to mol2 by Open Babel first)")
+    g.add_argument("input", help="a .str stream, a .mol2/.sdf molecule, or a "
+                                 ".pdb (Open Babel + cgenff binary)")
+    g.add_argument("output_dir")
+    g.add_argument("--ff", dest="cgenff_ff",
+                   help="directory with top_all36_cgenff.rtf + "
+                        "par_all36_cgenff.prm (a CHARMM-GUI toppar/); needed to "
+                        "merge a real stream over the base CGenFF force field")
+    g.add_argument("--resname", help="override the residue name in the .str")
+    g.add_argument("--penalty-flag", dest="penalty_flag", type=float,
+                   default=None,
+                   help="also list every parameter whose CGenFF penalty exceeds "
+                        "this (penalties are always reported, never refused)")
+    g.add_argument("--cgenff", help="path to the cgenff binary (mol2/sdf/pdb "
+                                    "input)")
+    g.add_argument("--ph", type=float, default=7.0,
+                   help="protonation pH for a .pdb input (default 7.0)")
+    g.add_argument("--obabel", help="path to obabel, if not on PATH (.pdb input)")
+    g.add_argument("--output-flag", dest="output_flag",
+                   help="flag the cgenff build uses to name its output file, "
+                        "if it does not write to stdout")
+
+    m = sub.add_parser("mol2",
+                       help="protonate a ligand PDB at a pH (default 7) and "
+                            "write a ParamChem-ready mol2 with Open Babel (no "
+                            "licence); take it to cgenff.silcsbio.com for a .str")
+    m.add_argument("pdb", help="the ligand as a PDB")
+    m.add_argument("output", help="the mol2 to write")
+    m.add_argument("--ph", type=float, default=7.0,
+                   help="protonation pH (default 7.0)")
+    m.add_argument("--obabel", help="path to obabel, if it is not on PATH")
+    m.add_argument("--no-h", dest="add_hydrogens", action="store_false",
+                   help="convert as-is, without adding hydrogens for a pH")
+
+    lb = sub.add_parser("ligand-batch",
+                        help="parameterise a whole directory of .str files at "
+                             "once; the base force field is read only once, so a "
+                             "library is far faster than a shell loop")
+    lb.add_argument("dir", help="a directory of .str stream files")
+    lb.add_argument("output_dir")
+    lb.add_argument("--ff", dest="cgenff_ff",
+                    help="toppar/ with top_all36_cgenff.rtf + par_all36_cgenff.prm "
+                         "to merge over (needed for real ParamChem streams)")
+    lb.add_argument("--penalty-flag", dest="penalty_flag", type=float,
+                    default=None,
+                    help="also list every parameter whose penalty exceeds this")
+
+    pl = sub.add_parser("place",
+                        help="put a positioned ligand into a built protein "
+                             "system (extends its .gro, topol.top and index)")
+    pl.add_argument("system_dir", help="a built system dir (step5_input.gro, "
+                                       "topol.top, index.ndx, toppar/)")
+    pl.add_argument("ligand_pdb", help="the ligand, positioned in the box frame")
+    pl.add_argument("ligand_itp", help="the ligand .itp from `lamellyx ligand`")
+    pl.add_argument("output_dir")
+    pl.add_argument("--atomtypes", dest="atomtypes_itp",
+                    help="ligand _atomtypes.itp (default: alongside the .itp)")
+    pl.add_argument("--resname", help="override the ligand residue name")
+
+    cs = sub.add_parser("check-system",
+                        help="structurally check a built system before grompp: "
+                             "topology/coordinate atom counts, molecule "
+                             "topologies, index coverage, net charge")
+    cs.add_argument("system_dir", help="a built system directory")
+
     sub.add_parser("lipids", help="lipids with a conformer library")
     sub.add_parser("test", help="run the test suite")
     sub.add_parser("dashboard",
@@ -163,6 +236,84 @@ def main(argv=None):
             **({"gmx": args.gmx} if args.gmx else {}),
         }), indent=2))
         return 0
+
+    if args.cmd == "ligand":
+        # Route on the extension so the one positional argument stays: a .str is
+        # a ParamChem stream, a .pdb is protonated to mol2 first, anything else
+        # is a mol2/sdf molecule for the binary.
+        low = args.input.lower()
+        key = ("str" if low.endswith(".str")
+               else "pdb" if low.endswith(".pdb") else "molecule")
+        s = {key: args.input, "output_dir": args.output_dir}
+        if key == "pdb":
+            s["ph"] = args.ph
+            if args.obabel:
+                s["obabel"] = args.obabel
+        if args.cgenff_ff:
+            s["cgenff_ff"] = args.cgenff_ff
+        if args.resname:
+            s["resname"] = args.resname
+        if args.penalty_flag is not None:
+            s["penalty_flag"] = args.penalty_flag
+        if args.cgenff:
+            s["cgenff"] = args.cgenff
+        if args.output_flag:
+            s["output_flag"] = args.output_flag
+        try:
+            print(json.dumps(api.generate_ligand_topology(s), indent=2))
+        except (ValueError, RuntimeError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+            return 1
+        return 0
+
+    if args.cmd == "ligand-batch":
+        s = {"dir": args.dir, "output_dir": args.output_dir}
+        if args.cgenff_ff:
+            s["cgenff_ff"] = args.cgenff_ff
+        if args.penalty_flag is not None:
+            s["penalty_flag"] = args.penalty_flag
+        try:
+            r = api.generate_ligand_topologies(s)
+        except (ValueError, FileNotFoundError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+            return 1
+        print(json.dumps(r, indent=2))
+        return 0 if r["ok"] else 1
+
+    if args.cmd == "mol2":
+        s = {"pdb": args.pdb, "output": args.output, "ph": args.ph,
+             "add_hydrogens": args.add_hydrogens}
+        if args.obabel:
+            s["obabel"] = args.obabel
+        try:
+            print(json.dumps(api.prepare_mol2(s), indent=2))
+        except (ValueError, RuntimeError, FileNotFoundError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+            return 1
+        return 0
+
+    if args.cmd == "place":
+        s = {"system_dir": args.system_dir, "ligand_pdb": args.ligand_pdb,
+             "ligand_itp": args.ligand_itp, "output_dir": args.output_dir}
+        if args.atomtypes_itp:
+            s["atomtypes_itp"] = args.atomtypes_itp
+        if args.resname:
+            s["resname"] = args.resname
+        try:
+            print(json.dumps(api.place_ligand(s), indent=2))
+        except (ValueError, FileNotFoundError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+            return 1
+        return 0
+
+    if args.cmd == "check-system":
+        try:
+            r = api.check_system({"system_dir": args.system_dir})
+        except (ValueError, FileNotFoundError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+            return 1
+        print(json.dumps(r, indent=2))
+        return 0 if r["ok"] else 1
 
     if args.cmd == "extract-protein":
         r = api.extract_protein(args.reference_dir, args.out_pdb,

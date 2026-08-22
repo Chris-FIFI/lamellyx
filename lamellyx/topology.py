@@ -74,28 +74,36 @@ def parse_itp(path):
                     cur = None
                 continue
             parts = line.split()
-            if section == "moleculetype":
-                cur = MoleculeTopology(name=parts[0])
-                mols[cur.name] = cur
-            elif section == "atoms" and cur is not None:
-                # nr type resnr residue atom cgnr charge mass
-                cur.resid.append(int(parts[2]))
-                cur.resname.append(parts[3])
-                cur.atomname.append(parts[4])
-                cur.charge.append(float(parts[6]) if len(parts) > 6 else 0.0)
-                cur.mass.append(float(parts[7]) if len(parts) > 7 else 0.0)
-            elif section == "bonds" and cur is not None:
-                cur.bonds.append((int(parts[0]) - 1, int(parts[1]) - 1))
-            elif section == "constraints" and cur is not None:
-                cur.bonds.append((int(parts[0]) - 1, int(parts[1]) - 1))
-            elif section == "settles" and cur is not None:
-                # Rigid water declares no bonds at all, only a settles line
-                # naming its oxygen. Without this the two O-H distances look
-                # like non-bonded contacts at 0.96 A, and a contact report on
-                # a solvated box is then dominated by tens of thousands of
-                # water molecules being flagged as clashing with themselves.
-                o = int(parts[0]) - 1
-                cur.bonds += [(o, o + 1), (o, o + 2), (o + 1, o + 2)]
+            # A short or non-numeric data line is corrupt input; turn the bare
+            # IndexError/ValueError it would raise into one clear error naming
+            # the file and line, so a bad .itp fails legibly rather than deep in
+            # a build or a placement.
+            try:
+                if section == "moleculetype":
+                    cur = MoleculeTopology(name=parts[0])
+                    mols[cur.name] = cur
+                elif section == "atoms" and cur is not None:
+                    # nr type resnr residue atom cgnr charge mass
+                    cur.resid.append(int(parts[2]))
+                    cur.resname.append(parts[3])
+                    cur.atomname.append(parts[4])
+                    cur.charge.append(float(parts[6]) if len(parts) > 6 else 0.0)
+                    cur.mass.append(float(parts[7]) if len(parts) > 7 else 0.0)
+                elif section == "bonds" and cur is not None:
+                    cur.bonds.append((int(parts[0]) - 1, int(parts[1]) - 1))
+                elif section == "constraints" and cur is not None:
+                    cur.bonds.append((int(parts[0]) - 1, int(parts[1]) - 1))
+                elif section == "settles" and cur is not None:
+                    # Rigid water declares no bonds at all, only a settles line
+                    # naming its oxygen. Without this the two O-H distances look
+                    # like non-bonded contacts at 0.96 A, and a contact report on
+                    # a solvated box is then dominated by tens of thousands of
+                    # water molecules being flagged as clashing with themselves.
+                    o = int(parts[0]) - 1
+                    cur.bonds += [(o, o + 1), (o, o + 2), (o + 1, o + 2)]
+            except (IndexError, ValueError) as exc:
+                raise ValueError("malformed [ %s ] line in %s: %r (%s)"
+                                 % (section, path, line, exc))
     return mols
 
 
@@ -149,13 +157,13 @@ def write_topol(path, itp_includes, molecules, system_name="membrane system",
     for name, count in molecules:
         if count:
             lines.append("%-8s%12d" % (name, count))
-    with open(path, "w") as fh:
+    with open(path, "w", newline="\n") as fh:
         fh.write("\n".join(lines) + "\n")
 
 
 def write_index(path, groups):
     """Write an index.ndx. `groups` is an ordered [(name, 0-based indices)]."""
-    with open(path, "w") as fh:
+    with open(path, "w", newline="\n") as fh:
         for name, idx in groups:
             fh.write("[ %s ]\n" % name)
             idx = np.asarray(idx, dtype=np.int64) + 1

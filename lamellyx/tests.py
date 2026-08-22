@@ -36,6 +36,12 @@ def test(fn):
     return fn
 
 
+class SkipTest(Exception):
+    """Raise from a test body to skip it rather than fail -- for a check that
+    needs an optional local resource, like the non-redistributable base CGenFF
+    force field, which is present on a developer's machine but not in CI."""
+
+
 def approx(a, b, tol=1e-9):
     assert abs(float(a) - float(b)) <= tol, "%r != %r (tol %g)" % (a, b, tol)
 
@@ -87,6 +93,30 @@ def regression_gro_handles_more_than_99999_atoms():
         int(ln[0:5]); float(ln[20:28])           # must still parse
     b, _ = fileio.read_gro(p)
     assert len(b) == n
+
+
+@test
+def regression_written_files_use_lf_newlines():
+    """Text-mode "w" on Windows turns \\n into CRLF, so lamellyx would emit CRLF
+    GROMACS files there -- byte-different from a Linux run and from the LF
+    reference converter, and a spurious every-line diff for anyone comparing the
+    two. Every writer passes newline="\\n"; this guards it, on the platform where
+    it actually manifests (a no-op assertion on Unix, which is LF regardless)."""
+    d = tempfile.mkdtemp()
+    n = 3
+    a = fileio.Atoms(["OH2"] * n, ["TIP3"] * n, np.arange(1, n + 1),
+                     np.zeros((n, 3)))
+    box = np.array([10.0, 10.0, 10.0])
+    gro = os.path.join(d, "t.gro"); fileio.write_gro(gro, a, box)
+    pdb = os.path.join(d, "t.pdb"); fileio.write_pdb(pdb, a, box)
+    top = os.path.join(d, "topol.top")
+    topology.write_topol(top, ["toppar/TIP3.itp"], [("TIP3", n)])
+    ndx = os.path.join(d, "index.ndx")
+    topology.write_index(ndx, [("System", np.arange(n))])
+    for p in (gro, pdb, top, ndx):
+        raw = open(p, "rb").read()
+        assert b"\r\n" not in raw, "%s has CRLF" % os.path.basename(p)
+        assert b"\n" in raw, "%s has no newline at all" % os.path.basename(p)
 
 
 @test
@@ -731,12 +761,83 @@ def endtoend_dashboard_api():
             else:
                 raise AssertionError("path traversal was served: %s" % attack)
 
+        # --- ligand tab: a CGenFF .str -> topology, no licence ----------
+        meoh = "\n".join([
+            "* methanol", "*", "read rtf card append", "* top", "*", "36 1",
+            "MASS -1 CG331 12.01100", "MASS -1 HGA3 1.00800",
+            "MASS -1 OG311 15.99940", "MASS -1 HGP1 1.00800",
+            "RESI MEOH 0.000", "GROUP",
+            "ATOM C1 CG331 -0.040", "ATOM H1 HGA3 0.090", "ATOM H2 HGA3 0.090",
+            "ATOM H3 HGA3 0.090", "ATOM O1 OG311 -0.650", "ATOM HO1 HGP1 0.420",
+            "BOND C1 H1", "BOND C1 H2", "BOND C1 H3", "BOND C1 O1", "BOND O1 HO1",
+            "END", "read param card flex append", "* par", "*",
+            "BONDS", "CG331 HGA3 322.00 1.1110", "CG331 OG311 428.00 1.4200",
+            "OG311 HGP1 545.00 0.9600",
+            "ANGLES", "HGA3 CG331 HGA3 35.50 108.40",
+            "HGA3 CG331 OG311 45.90 108.89", "CG331 OG311 HGP1 50.00 106.00",
+            "DIHEDRALS", "HGA3 CG331 OG311 HGP1 0.1400 3 0.00",
+            "NONBONDED", "CG331 0.0 -0.0780 2.0500", "HGA3 0.0 -0.0240 1.3400",
+            "OG311 0.0 -0.1921 1.7650", "HGP1 0.0 -0.0460 0.2245", "END"])
+        rep = post("/api/ligand", {"str_text": meoh})
+        assert rep["resname"] == "MEOH" and rep["n_atoms"] == 6, rep
+        assert abs(rep["net_charge"]) < 1e-9, rep
+        assert rep["files"] == ["MEOH.itp", "MEOH_atomtypes.itp"], rep
+        # the .itp text rides along so the page can show it inline
+        assert "[ moleculetype ]" in rep.get("itp_text", ""), "no inline .itp"
+        itp = raw("/api/file/ligands/MEOH.itp", timeout=10).read()
+        assert b"[ moleculetype ]" in itp and b"[ atoms ]" in itp, itp[:80]
+        # an empty stream is a clean 400, not a 500
+        assert status("/api/ligand", data=b'{"str_text": ""}') == 400
+        # a malformed JSON body is a clean 400, not a 500
+        assert status("/api/ligand", data=b"{not valid json") == 400
+        # a real (non-self-contained) stream with no toppar is refused with 400,
+        # the converter's own supplement diagnostic, not a 500
+        assert status("/api/ligand",
+                      data=_json.dumps({"str_text": _JZ4_STR}).encode()) == 400
+        # a body that is valid JSON but not an object, or a wrong-typed field,
+        # is a clean 400 -- not a 500 from a .get()/.strip() on the wrong type
+        for bad in (b"[]", b"123", b"null", b'{"str_text": 12345}',
+                    b'{"resname": ["x"], "str_text": "y"}'):
+            assert status("/api/ligand", data=bad) == 400, bad
+        assert status("/api/delete", data=b"{}") == 400        # missing 'id'
+        assert status("/api/delete", data=b"[]") == 400        # not an object
+        assert status("/api/check", data=b"123") == 400        # not an object
+
+        # the ligand tab remembers the last force-field directory used, so the
+        # long toppar path need not be re-typed. Build with a (minimal) FF, then
+        # /api/state should report it for the page to pre-fill.
+        ffdir = os.path.join(ws, "ff")
+        os.makedirs(ffdir, exist_ok=True)
+        with open(os.path.join(ffdir, "top_all36_cgenff.rtf"), "w") as fh:
+            fh.write("MASS -1 CG331 12.011 C\n")
+        with open(os.path.join(ffdir, "par_all36_cgenff.prm"), "w") as fh:
+            fh.write("BONDS\n")
+        assert get("/api/state").get("last_cgenff_ff", "") == "", "ff already set"
+        post("/api/ligand", {"str_text": meoh, "cgenff_ff": ffdir})
+        assert get("/api/state")["last_cgenff_ff"] == ffdir, "ff not remembered"
+
         assert get("/api/state")["history"], "build did not reach the history"
         post("/api/delete", {"id": jid})
         assert not os.path.isdir(os.path.join(ws, jid))
     finally:
         srv.shutdown()
         shutil.rmtree(ws, ignore_errors=True)
+
+
+@test
+def regression_dashboard_does_not_shadow_window_history():
+    """The page defined `function history()` for the build list, which shadowed
+    window.history; the token-scrub call `history.replaceState(...)` then threw
+    on load and every button handler bound after it silently failed -- the whole
+    UI was dead. Guard the name so the collision cannot come back, and keep the
+    ligand tab wired to its endpoint."""
+    from . import dashboard
+    assert "function history(" not in dashboard.PAGE, \
+        "the page shadows window.history again -- rename the history() function"
+    assert "history.replaceState" in dashboard.PAGE      # still scrubs the token
+    for needle in ('id="tab-ligand"', "/api/ligand", "Make topology",
+                   "showLigand"):
+        assert needle in dashboard.PAGE, needle
 
 
 @test
@@ -992,6 +1093,10 @@ def endtoend_json_api_round_trip():
     assert "step5_input.gro" in r["files"]
     assert "gmx grompp" in r["next_command"]
     assert _json.dumps(r)                                # must serialise
+    # check_system validates a real bilayer build too (MEMB/SOLV, no SOLU)
+    cs = api.check_system({"system_dir": os.path.join(tmp, "b")})
+    assert cs["ok"] and cs["index_checked"] == "MEMB+SOLV", cs
+    assert cs["atoms"] == r["counts"]["TOTAL_ATOMS"], (cs["atoms"], r["counts"])
     shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -1696,6 +1801,2127 @@ def regression_pdb2gmx_failure_is_reported_with_its_own_message():
         raise AssertionError("a pdb2gmx failure was swallowed")
 
 
+# ==========================================================================
+# cgenff -- ligand topology from a CGenFF stream file
+# ==========================================================================
+
+# A hand-written ethanol .str, faithful to ParamChem's format: a `read rtf`
+# half naming the atoms, charges and bonds, and a `read param` half with the
+# bonded and Lennard-Jones parameters, penalties in the comments. The values
+# are chosen so the GROMACS numbers can be worked out by hand in the tests.
+_ETOH_STR = """\
+* Toppar stream file for ethanol -- lamellyx test fixture
+*
+
+read rtf card append
+* Topologies
+*
+36 1
+
+MASS -1 CG331   12.01100 ! aliphatic C for CH3
+MASS -1 CG321   12.01100 ! aliphatic C for CH2
+MASS -1 OG311   15.99940 ! hydroxyl O
+MASS -1 HGA3     1.00800 ! aliphatic H, CH3
+MASS -1 HGA2     1.00800 ! aliphatic H, CH2
+MASS -1 HGP1     1.00800 ! polar H
+
+RESI ETOH   0.000
+GROUP
+ATOM C1  CG331  -0.270 !   0.000
+ATOM H11 HGA3    0.090 !   0.000
+ATOM H12 HGA3    0.090 !   0.000
+ATOM H13 HGA3    0.090 !   0.000
+ATOM C2  CG321   0.050 !   0.000
+ATOM H21 HGA2    0.090 !   0.000
+ATOM H22 HGA2    0.090 !   0.000
+ATOM O1  OG311  -0.650 !   0.000
+ATOM HO1 HGP1    0.420 !   0.000
+BOND C1 C2
+BOND C1 H11
+BOND C1 H12
+BOND C1 H13
+BOND C2 O1
+BOND C2 H21
+BOND C2 H22
+BOND O1 HO1
+
+END
+
+read param card flex append
+* Parameters
+*
+
+BONDS
+CG321 CG331   222.50   1.5280 ! ETOH, penalty= 0.6
+CG321 OG311   428.00   1.4200 ! ETOH, penalty= 1.0
+CG331 HGA3    322.00   1.1110 ! ETOH, penalty= 0.0
+CG321 HGA2    309.00   1.1110 ! ETOH, penalty= 0.0
+OG311 HGP1    545.00   0.9600 ! ETOH, penalty= 0.0
+
+ANGLES
+CG331 CG321 OG311   75.70   110.10 ! ETOH, penalty= 2.0
+CG321 CG331 HGA3    34.60   110.10  22.53  2.1790 ! ETOH, penalty= 0.0
+HGA3  CG331 HGA3    35.50   108.40   5.40  1.8020 ! ETOH, penalty= 0.0
+CG331 CG321 HGA2    34.60   110.10  22.53  2.1790 ! ETOH, penalty= 0.0
+OG311 CG321 HGA2    45.90   108.89 ! ETOH, penalty= 0.0
+HGA2  CG321 HGA2    35.50   109.00   5.40  1.8020 ! ETOH, penalty= 0.0
+CG321 OG311 HGP1    50.00   106.00 ! ETOH, penalty= 0.0
+
+DIHEDRALS
+OG311 CG321 CG331 HGA3   0.1600  3   0.00 ! ETOH, penalty= 0.0
+HGA2  CG321 CG331 HGA3   0.1600  3   0.00 ! ETOH, penalty= 0.0
+CG331 CG321 OG311 HGP1   0.1400  3   0.00 ! ETOH, penalty= 0.0
+HGA2  CG321 OG311 HGP1   0.1400  3   0.00 ! ETOH, penalty= 0.0
+X     CG321 CG331 X      0.1600  3   0.00 ! wildcard, penalty= 0.0
+X     CG321 OG311 X      0.1400  3   0.00 ! wildcard, penalty= 0.0
+
+IMPROPERS
+
+NONBONDED nbxmod 5 atom cdiel
+CG331   0.0  -0.0780   2.0400   0.0  -0.0100   1.9000 ! penalty 0
+CG321   0.0  -0.0560   2.0100   0.0  -0.0100   1.9000
+OG311   0.0  -0.1921   1.7650
+HGA3    0.0  -0.0240   1.3400
+HGA2    0.0  -0.0280   1.3400
+HGP1    0.0  -0.0460   0.2245
+
+END
+RETURN
+"""
+
+
+@test
+def reference_cgenff_unit_conversions():
+    """The conversions CHARMM->GROMACS, checked against numbers worked out by
+    hand. A wrong factor here is the "silently wrong energies" failure the whole
+    package is arranged to avoid, so every factor gets a known answer."""
+    from . import cgenff as c
+
+    # bond: b0 A -> nm; kb doubles, kcal->kJ, /A^2 -> /nm^2  (x 836.8)
+    b0, kb = c.bond_to_gmx(222.50, 1.5280)
+    approx(b0, 0.15280, 1e-9)
+    approx(kb, 222.50 * 836.8, 1e-4)          # 186188.0
+
+    # angle with Urey-Bradley: force constants double, kcal->kJ; UB length A->nm
+    th0, kth, ub0, kub = c.angle_to_gmx(34.60, 110.10, 22.53, 2.1790)
+    approx(th0, 110.10, 1e-9)
+    approx(kth, 34.60 * 8.368, 1e-4)          # 289.5328
+    approx(ub0, 0.21790, 1e-9)
+    approx(kub, 22.53 * 836.8, 1e-3)          # 18853.104
+
+    # a plain angle carries no UB term
+    _, _, ub0b, kubb = c.angle_to_gmx(75.70, 110.10, 0.0, 0.0)
+    approx(ub0b, 0.0, 1e-12)
+    approx(kubb, 0.0, 1e-12)
+
+    # proper dihedral: NO factor of two, only kcal->kJ
+    phi0, kphi = c.dihedral_to_gmx(0.1600, 0.00)
+    approx(phi0, 0.0, 1e-12)
+    approx(kphi, 0.1600 * 4.184, 1e-9)        # 0.66944
+
+    # improper: harmonic, so the force constant doubles
+    xi0, kxi = c.improper_to_gmx(120.0, 0.0)
+    approx(xi0, 0.0, 1e-12)
+    approx(kxi, 120.0 * 8.368, 1e-6)          # 1004.16
+
+    # LJ: Rmin/2 (A) -> sigma (nm); |eps| kcal -> kJ
+    sigma, eps = c.lj_to_gmx(0.0780, 2.0400)
+    approx(sigma, 2.0400 * (0.2 / 2.0 ** (1.0 / 6.0)), 1e-9)
+    approx(eps, 0.0780 * 4.184, 1e-9)
+
+
+@test
+def reference_cgenff_parses_charmm_bond_record_forms():
+    """CHARMM RTF bonds come in forms the simple fixtures do not have: several
+    pairs on one BOND line, and the DOUBLE / TRIPLE keywords. Each declares the
+    same kind of bond; IC and other records are ignored, not misread."""
+    from . import cgenff as c
+    rtf = "\n".join([
+        "read rtf card append", "* t", "*", "36 1",
+        "RESI X 0.000", "GROUP",
+        "ATOM A CG331 0.0", "ATOM B CG331 0.0", "ATOM D CG331 0.0",
+        "ATOM E CG331 0.0",
+        "BOND A B  B D",                      # two pairs on one line
+        "DOUBLE D E",                         # a double bond is still one bond
+        "IC A B D E 1.5 110 180 110 1.5",     # ignored
+        "PATCHING FIRS NONE LAST NONE",       # ignored
+        "END"])
+    s = c.parse_stream(rtf)
+    assert len(s.atoms) == 4, s.atoms
+    assert s.bonds == [("A", "B"), ("B", "D"), ("D", "E")], s.bonds
+
+
+@test
+def invariant_cgenff_type_names_infer_the_right_element():
+    """A real ParamChem stream has no MASS records, so an atom's mass -- and the
+    atomic number that reaches [ atomtypes ] -- is read off its CGenFF type name.
+    A wrong element is a silent mass error, so check the inference across the
+    periodic subset CGenFF uses, including the two-letter halogens that must beat
+    the one-letter match (CLGA1 is chlorine, not carbon)."""
+    from . import cgenff as c
+    expect = {
+        "CG331": ("C", 12.011), "HGA3": ("H", 1.008), "OG311": ("O", 15.999),
+        "NG2R61": ("N", 14.007), "SG311": ("S", 32.06), "PG1": ("P", 30.974),
+        "FGA1": ("F", 18.998), "CLGA1": ("CL", 35.45), "BRGA1": ("BR", 79.904),
+        "IGR1": ("I", 126.904),
+    }
+    for t, (elem, mass) in expect.items():
+        assert c._element_from_type(t) == elem, (t, c._element_from_type(t))
+        approx(c._mass_from_type(t), mass, 0.01)
+    # the atomic numbers that reach [ atomtypes ] follow from the mass
+    for t, z in (("FGA1", 9), ("CLGA1", 17), ("BRGA1", 35), ("IGR1", 53)):
+        assert c._atomic_number(c._mass_from_type(t)) == z, t
+
+
+@test
+def regression_cgenff_malformed_rtf_records_are_refused_cleanly():
+    """A truncated MASS/RESI/ATOM record used to crash with a bare IndexError --
+    and, pasted into the dashboard, a 500. A fuzz pass over thousands of
+    perturbed streams turned it up. Each must be a clean ValueError now."""
+    from . import cgenff as c
+    for bad in ("ATOM", "ATOM C1", "ATOM C1 CG331",     # missing type / charge
+                "MASS", "MASS -1 CG331", "RESI"):        # missing fields
+        stream = "read rtf card append\n* t\n*\n36 1\n%s\nEND\n" % bad
+        try:
+            c.parse_stream(stream)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("malformed record %r was accepted" % bad)
+
+
+@test
+def regression_cgenff_malformed_bond_and_improper_records_are_refused():
+    """A BOND with an odd atom count, or an IMPR not a multiple of four, would
+    drop an orphan silently -- a missing bond, or a planar centre gone
+    non-planar. Both must be refused, not quietly truncated by the grouping."""
+    from . import cgenff as c
+    odd_bond = _ETOH_STR.replace("BOND C1 C2", "BOND C1 C2 O1")   # three atoms
+    try:
+        c.parse_stream(odd_bond)
+    except ValueError as exc:
+        assert "even number" in str(exc), exc
+    else:
+        raise AssertionError("an odd BOND record was accepted")
+
+    short_impr = _FALD_STR.replace("IMPR C1 O1 H1 H2", "IMPR C1 O1 H1")
+    try:
+        c.parse_stream(short_impr)
+    except ValueError as exc:
+        assert "multiple of" in str(exc), exc
+    else:
+        raise AssertionError("a truncated IMPR record was accepted")
+
+
+@test
+def reference_cgenff_handles_a_degenerate_topology():
+    """A ligand can be a single atom -- a bound ion -- with no bonds, angles or
+    dihedrals. The graph enumeration and the writer must handle the empty bond
+    list and still produce a valid, integer-charge topology, not choke on it."""
+    from . import cgenff as c
+    ion = ("read rtf card append\n* t\n*\n36 1\nRESI CLA -1.000\nGROUP\n"
+           "ATOM CL CLA -1.000\nEND\nread param card flex append\n"
+           "BONDS\nANGLES\nDIHEDRALS\nNONBONDED\nCLA 0.0 -0.150 2.27\nEND\n")
+    r = c.generate_ligand_topology(ion, tempfile.mkdtemp())
+    assert r["n_atoms"] == 1 and r["n_bonds"] == 0 and r["n_angles"] == 0, r
+    assert r["n_dihedrals"] == 0 and r["n_lonepairs"] == 0, r
+    approx(r["net_charge"], -1.0, 1e-9)
+    assert r["net_charge_is_integer"], r
+    mol = topology.parse_itp(r["itp"])["CLA"]
+    assert mol.natoms == 1 and len(mol.bonds) == 0, (mol.natoms, mol.bonds)
+
+
+@test
+def reference_cgenff_parses_ethanol_stream():
+    """Every field the rest of the module relies on comes off the .str intact:
+    atoms and charges, the bond list, the masses, the parameter tables, and the
+    penalties from the comments."""
+    from . import cgenff as c
+    s = c.parse_stream(_ETOH_STR)
+
+    assert s.resname == "ETOH", s.resname
+    assert len(s.atoms) == 9, len(s.atoms)
+    assert [a.name for a in s.atoms[:2]] == ["C1", "H11"]
+    assert s.atoms[0].type == "CG331" and s.atoms[0].charge == -0.270
+    approx(sum(a.charge for a in s.atoms), 0.0, 1e-9)   # neutral molecule
+    assert len(s.bonds) == 8, s.bonds
+    assert ("C2", "O1") in s.bonds
+
+    assert s.masses["OG311"] == 15.99940
+    assert s.bond_p[("CG321", "CG331")][:2] == (222.50, 1.5280)
+    # penalty read out of the comment
+    approx(s.bond_p[("CG321", "OG311")][2], 1.0, 1e-9)
+    # angle with and without a Urey-Bradley term
+    assert s.angle_p[("CG321", "CG331", "HGA3")][2:4] == (22.53, 2.1790)
+    assert s.angle_p[("CG331", "CG321", "OG311")][2:4] == (0.0, 0.0)
+    # dihedral stored as a list of terms (multiplicity series)
+    assert isinstance(s.dihe_p[("OG311", "CG321", "CG331", "HGA3")], list)
+    # nonbonded 1-4 columns kept separately from the primary LJ
+    eps, rmin2, eps14, rmin2_14, _ = s.nb["CG331"]
+    assert (eps, rmin2, eps14, rmin2_14) == (0.0780, 2.0400, 0.0100, 1.9000)
+
+
+@test
+def reference_cgenff_enumerates_angles_and_dihedrals():
+    """Angles and dihedrals are not in the .str -- they follow from the bond
+    graph, and CHARMM-GUI derives them the same way. Wrong enumeration is wrong
+    physics, so the counts are checked against a graph small enough to count."""
+    from . import cgenff as c
+    s = c.parse_stream(_ETOH_STR)
+    names = [a.name for a in s.atoms]
+
+    angles = c.enumerate_angles(names, s.bonds)
+    # C1 centre: C(4,2)=6, C2 centre: 6, O1 centre: 1  ->  13
+    assert len(angles) == 13, len(angles)
+
+    dihedrals = c.enumerate_dihedrals(names, s.bonds)
+    # only the C1-C2 (3x3) and C2-O1 (3x1) bonds carry dihedrals -> 12
+    assert len(dihedrals) == 12, len(dihedrals)
+    # each dihedral counted once, not once per direction
+    canon = {frozenset(((d[0], d[1]), (d[2], d[3]))) for d in dihedrals}
+    assert len(canon) == len(dihedrals)
+
+    pairs = c.one_four_pairs(names, s.bonds, dihedrals)
+    bonded = {frozenset(b) for b in s.bonds}
+    one_three = {frozenset((a, cc)) for a, _, cc in angles}
+    for p in pairs:
+        assert frozenset(p) not in bonded, p        # never a 1-2 pair
+        assert frozenset(p) not in one_three, p      # never a 1-3 pair
+    assert pairs, "ethanol has 1-4 pairs"
+
+
+@test
+def endtoend_cgenff_writes_itp_the_topology_reader_accepts():
+    """The real requirement: what the converter writes must be something the
+    existing topology reader -- the same one the builder uses -- can load, with
+    the atoms, bonds and total charge intact."""
+    from . import cgenff as c
+    d = tempfile.mkdtemp()
+    rep = c.generate_ligand_topology(_ETOH_STR, d)
+
+    assert rep["ok"] and rep["resname"] == "ETOH", rep
+    assert rep["n_atoms"] == 9 and rep["n_bonds"] == 8, rep
+    assert rep["n_angles"] == 13 and rep["n_dihedrals"] == 12, rep
+    approx(rep["net_charge"], 0.0, 1e-9)
+    assert set(rep["files"]) == {"ETOH.itp", "ETOH_atomtypes.itp"}, rep["files"]
+    for f in rep["files"]:
+        assert os.path.exists(os.path.join(d, f)), f
+
+    # load it back through the package's own parser
+    tops = topology.parse_itp(os.path.join(d, "ETOH.itp"))
+    assert set(tops) == {"ETOH"}, sorted(tops)
+    mol = tops["ETOH"]
+    assert mol.natoms == 9, mol.natoms
+    approx(mol.total_charge, 0.0, 1e-6)
+    assert len(mol.bonds) == 8, mol.bonds
+    # the bond graph survived the round trip: C1 (atom 0) bonds to C2 and 3 H
+    adj = mol.adjacency()
+    assert len(adj[0]) == 4, adj[0]
+
+    # atom types are declared before they are used, and every one is defined
+    with open(os.path.join(d, "ETOH_atomtypes.itp")) as fh:
+        atp = fh.read()
+    for t in ("CG331", "CG321", "OG311", "HGA3", "HGA2", "HGP1"):
+        assert t in atp, t
+    assert "[ atomtypes ]" in atp and "[ pairtypes ]" in atp
+
+
+@test
+def regression_cgenff_penalty_is_reported_not_refused():
+    """A high CGenFF penalty is REPORTED, not refused: most biological ligands
+    lean on analogy, so refusing on penalty would reject the normal case. The
+    build succeeds and the worst penalty and offenders come back in the report;
+    penalty_flag optionally lists everything above a chosen number."""
+    from . import cgenff as c
+    d = tempfile.mkdtemp()
+    bad = _ETOH_STR.replace("penalty= 1.0", "penalty= 120.5")
+
+    rep = c.generate_ligand_topology(bad, d, penalty_flag=50.0)
+    assert rep["ok"] and rep["worst_penalty"] == 120.5, rep
+    # the offending bond is named in the reported penalties
+    assert any("CG321-OG311" in lbl for lbl, _ in rep["penalties"]), rep["penalties"]
+    # and flagged, because it is above the number we asked about
+    flag = rep["flagged_above_50.0"]
+    assert any(p == 120.5 for _, p in flag), flag
+
+
+@test
+def regression_cgenff_missing_parameter_is_refused_not_silently_dropped():
+    """If the .str lacks a parameter the molecule needs, a partial topology
+    would run with a wrong (missing) term. That must be refused and the gap
+    named, not quietly skipped."""
+    from . import cgenff as c
+    d = tempfile.mkdtemp()
+    # drop the C-O bond parameter the molecule cannot do without
+    broken = _ETOH_STR.replace(
+        "CG321 OG311   428.00   1.4200 ! ETOH, penalty= 1.0\n", "")
+    try:
+        c.generate_ligand_topology(broken, d)
+    except ValueError as exc:
+        assert "missing" in str(exc).lower(), exc
+        assert "C2-O1" in str(exc) or "CG321-OG311" in str(exc), exc
+    else:
+        raise AssertionError("a missing parameter was silently dropped")
+
+
+@test
+def regression_cgenff_dihedral_wildcard_matches():
+    """CGenFF gives many dihedrals only as wildcards (X b c X). Dropping the
+    exact terms must still resolve through the wildcard, or good molecules fail
+    to build."""
+    from . import cgenff as c
+    d = tempfile.mkdtemp()
+    only_wild = (_ETOH_STR
+                 .replace("OG311 CG321 CG331 HGA3   0.1600  3   0.00 "
+                          "! ETOH, penalty= 0.0\n", "")
+                 .replace("HGA2  CG321 CG331 HGA3   0.1600  3   0.00 "
+                          "! ETOH, penalty= 0.0\n", ""))
+    rep = c.generate_ligand_topology(only_wild, d)
+    assert rep["ok"] and rep["n_dihedrals"] == 12, rep
+
+
+# Formaldehyde: the smallest molecule with an improper (keeping the carbonyl
+# planar) and with NO proper dihedrals -- so it exercises the improper path,
+# which ethanol cannot, and the empty-dihedral edge case at the same time.
+_FALD_STR = """\
+* Toppar stream file for formaldehyde -- lamellyx test fixture
+*
+
+read rtf card append
+* Topologies
+*
+36 1
+
+MASS -1 CG2O1   12.01100 ! carbonyl C
+MASS -1 OG2D1   15.99940 ! carbonyl O
+MASS -1 HGR52    1.00800 ! aldehyde H
+
+RESI FALD   0.000
+GROUP
+ATOM C1  CG2O1   0.420 !   0.000
+ATOM O1  OG2D1  -0.510 !   0.000
+ATOM H1  HGR52   0.045 !   0.000
+ATOM H2  HGR52   0.045 !   0.000
+BOND C1 O1
+BOND C1 H1
+BOND C1 H2
+IMPR C1 O1 H1 H2
+
+END
+
+read param card flex append
+* Parameters
+*
+
+BONDS
+CG2O1 OG2D1   620.00   1.2200 ! FALD, penalty= 0.0
+CG2O1 HGR52   330.00   1.1000 ! FALD, penalty= 0.0
+
+ANGLES
+OG2D1 CG2O1 HGR52   44.00   122.00 ! FALD, penalty= 0.0
+HGR52 CG2O1 HGR52   40.00   116.00 ! FALD, penalty= 0.0
+
+DIHEDRALS
+
+IMPROPERS
+CG2O1 OG2D1 HGR52 HGR52   14.00   0   0.00 ! FALD, penalty= 3.0
+
+NONBONDED nbxmod 5 atom cdiel
+CG2O1   0.0  -0.1050   1.9800
+OG2D1   0.0  -0.1200   1.7000
+HGR52   0.0  -0.0460   1.1000
+
+END
+RETURN
+"""
+
+
+@test
+def reference_cgenff_improper_is_converted():
+    """The improper path is separate code from the propers and, unlike them,
+    has a factor of two. A molecule with an improper and no proper dihedrals
+    isolates it. Kpsi 14 -> 14 * 2 * 4.184 = 117.152 kJ/mol/rad^2."""
+    from . import cgenff as c
+    s = c.parse_stream(_FALD_STR)
+    assert s.impropers == [("C1", "O1", "H1", "H2")], s.impropers
+    assert ("CG2O1", "OG2D1", "HGR52", "HGR52") in s.impr_p
+
+    xi0, kxi = c.improper_to_gmx(*s.impr_p[
+        ("CG2O1", "OG2D1", "HGR52", "HGR52")][:2])
+    approx(xi0, 0.0, 1e-12)
+    approx(kxi, 14.00 * 8.368, 1e-4)          # 117.152
+
+    d = tempfile.mkdtemp()
+    rep = c.generate_ligand_topology(_FALD_STR, d)
+    assert rep["n_impropers"] == 1 and rep["n_dihedrals"] == 0, rep
+    assert rep["n_angles"] == 3, rep         # O-C-H, O-C-H, H-C-H; no propers
+
+    # the improper is written as a type-2 dihedral with the doubled constant
+    with open(os.path.join(d, "FALD.itp")) as fh:
+        text = fh.read()
+    assert "; impropers (type 2)" in text, text
+    # the converted constant appears on a funct-2 line
+    hit = [ln for ln in text.splitlines()
+           if ln.split()[4:5] == ["2"] and "1.171520e+02" in ln]
+    assert hit, "no funct-2 improper line with kxi=117.152:\n" + text
+
+    # and it still loads through the package parser (which ignores impropers)
+    mol = topology.parse_itp(os.path.join(d, "FALD.itp"))["FALD"]
+    assert mol.natoms == 4 and len(mol.bonds) == 3, (mol.natoms, mol.bonds)
+
+
+@test
+def regression_cgenff_improper_wildcard_matches():
+    """CGenFF improper parameters are very often wildcarded on the outer atoms
+    (`central X X X`). That must resolve, or a planar centre loses its improper
+    and goes non-planar -- a silent geometry error, not a build failure."""
+    from . import cgenff as c
+    d = tempfile.mkdtemp()
+    wild = _FALD_STR.replace(
+        "CG2O1 OG2D1 HGR52 HGR52   14.00   0   0.00 ! FALD, penalty= 3.0",
+        "CG2O1 X     X     X       14.00   0   0.00 ! FALD, penalty= 3.0")
+    rep = c.generate_ligand_topology(wild, d)
+    assert rep["ok"] and rep["n_impropers"] == 1, rep
+    # the wildcarded improper's penalty still reaches the gate
+    assert rep["worst_penalty"] == 3.0, rep
+
+
+def _section_lines(itp_text, section):
+    """The data lines under `[ section ]` in an .itp -- comments and blanks
+    stripped, stopping at the next header. Repeated headers (an .itp has two
+    [ dihedrals ]) are concatenated, which is what a reader wants."""
+    want = "[ %s ]" % section
+    out, take = [], False
+    for raw in itp_text.splitlines():
+        line = raw.split(";")[0].rstrip()
+        if not line.strip():
+            continue
+        if line.strip().startswith("["):
+            take = (line.strip() == want)
+            continue
+        if take:
+            out.append(line)
+    return out
+
+
+# Chloromethane with a halogen sigma-hole lone pair. LPH is given no MASS and no
+# NONBONDED record on purpose: type-name inference would make it carbon (12.011)
+# and the LJ lookup would fail, so the fixture proves the lone-pair path forces
+# both to zero. Net charge sums to 0.
+_CLM_STR = """\
+* Toppar stream file for chloromethane -- lamellyx test fixture (halogen LP)
+*
+
+read rtf card append
+* Topologies
+*
+36 1
+
+MASS -1 CG331   12.01100 ! aliphatic C for CH3
+MASS -1 HGA3     1.00800 ! aliphatic H, CH3
+MASS -1 CLGA1   35.45000 ! aliphatic chlorine
+
+RESI CLM    0.000
+GROUP
+ATOM C1  CG331  -0.070 !   0.000
+ATOM H1  HGA3    0.090 !   0.000
+ATOM H2  HGA3    0.090 !   0.000
+ATOM H3  HGA3    0.090 !   0.000
+ATOM CL1 CLGA1  -0.290 !   0.000
+ATOM LP1 LPH     0.090 !   0.000
+BOND C1 H1
+BOND C1 H2
+BOND C1 H3
+BOND C1 CL1
+LONEPAIR COLINEAR LP1 CL1 C1 DIST 1.5000 SCALE 0.0
+
+END
+
+read param card flex append
+* Parameters
+*
+
+BONDS
+CG331 HGA3    322.00   1.1110 ! CLM, penalty= 0.0
+CG331 CLGA1   222.00   1.7760 ! CLM, penalty= 5.0
+
+ANGLES
+HGA3 CG331 HGA3    35.50   108.40 ! CLM, penalty= 0.0
+HGA3 CG331 CLGA1   34.00   108.00 ! CLM, penalty= 0.0
+
+DIHEDRALS
+
+IMPROPERS
+
+NONBONDED nbxmod 5 atom cdiel
+CG331   0.0  -0.0780   2.0500
+HGA3    0.0  -0.0240   1.3400
+CLGA1   0.0  -0.3430   1.9100
+
+END
+RETURN
+"""
+
+
+@test
+def reference_cgenff_colinear_lone_pair_becomes_a_virtual_site():
+    """A halogen sigma-hole lone pair is a COLINEAR virtual site. It must reach
+    the .itp as a [ virtual_sites2 ] funct-2 term with a = -(dist in nm), and
+    -- since a virtual site has no bond -- be handed the host atom's own
+    1-2/1-3/1-4 exclusions explicitly, or GROMACS makes none for it."""
+    from . import cgenff as c
+    s = c.parse_stream(_CLM_STR)
+    assert len(s.lonepairs) == 1, s.lonepairs
+    lp = s.lonepairs[0]
+    assert lp.kind.upper().startswith("COLI"), lp.kind
+    assert lp.hosts[:2] == ["CL1", "C1"], lp.hosts
+    approx(lp.dist, 1.5, 1e-9)
+
+    d = tempfile.mkdtemp()
+    rep = c.generate_ligand_topology(_CLM_STR, d)
+    assert rep["ok"] and rep["n_lonepairs"] == 1, rep
+    approx(rep["net_charge"], 0.0, 1e-9)
+
+    with open(os.path.join(d, "CLM.itp")) as fh:
+        itp = fh.read()
+
+    # the virtual site: LP(6) from CL1(5) and C1(1), funct 2, a = -(1.5*0.1) nm
+    vlines = _section_lines(itp, "virtual_sites2")
+    assert len(vlines) == 1, vlines
+    p = vlines[0].split()
+    assert p[:4] == ["6", "5", "1", "2"], p
+    approx(float(p[4]), -0.15, 1e-9)
+
+    # explicit exclusions: LP(6) against host CL1(5) and all within three bonds
+    elines = _section_lines(itp, "exclusions")
+    assert len(elines) == 1, elines
+    ex = [int(x) for x in elines[0].split()]
+    assert ex[0] == 6 and set(ex[1:]) == {1, 2, 3, 4, 5}, ex
+
+    # the LP is massless in [ atoms ], though type inference would give 12.011
+    atom_lines = _section_lines(itp, "atoms")
+    lp_row = next(ln for ln in atom_lines if ln.split()[4] == "LP1")
+    approx(float(lp_row.split()[7]), 0.0, 1e-12)
+
+    # and its atom type carries atomic number 0 and mass 0, LJ absent -> zero
+    with open(os.path.join(d, "CLM_atomtypes.itp")) as fh:
+        at = fh.read()
+    lph = next(ln for ln in _section_lines(at, "atomtypes")
+               if ln.split()[0] == "LPH")
+    assert lph.split()[1] == "0", lph
+    approx(float(lph.split()[2]), 0.0, 1e-12)
+
+    # the whole file still loads through the package parser
+    mol = topology.parse_itp(os.path.join(d, "CLM.itp"))["CLM"]
+    assert mol.natoms == 6, mol.natoms
+
+
+@test
+def regression_cgenff_noncolinear_lone_pair_is_refused():
+    """CGenFF only emits COLINEAR lone pairs; anything else needs a
+    virtual_sites3 term this converter does not write. It must refuse loudly,
+    not drop the site and return a silently-wrong topology."""
+    from . import cgenff as c
+    rel = _CLM_STR.replace(
+        "LONEPAIR COLINEAR LP1 CL1 C1 DIST 1.5000 SCALE 0.0",
+        "LONEPAIR RELATIVE LP1 CL1 C1 H1 DIST 1.5 ANGLE 90.0 DIHE 0.0")
+    try:
+        c.generate_ligand_topology(rel, tempfile.mkdtemp())
+    except ValueError as exc:
+        assert "COLINEAR" in str(exc), exc
+    else:
+        assert False, "a RELATIVE lone pair was not refused"
+
+
+@test
+def regression_cgenff_lone_pair_with_coincident_hosts_is_refused():
+    """A COLINEAR lone pair whose two hosts are the same atom would emit a
+    virtual_sites2 with a zero direction vector -- a division by zero in
+    grompp/mdrun. Refuse it rather than write a broken topology."""
+    from . import cgenff as c
+    bad = _CLM_STR.replace(
+        "LONEPAIR COLINEAR LP1 CL1 C1 DIST 1.5000 SCALE 0.0",
+        "LONEPAIR COLINEAR LP1 CL1 CL1 DIST 1.5000 SCALE 0.0")
+    try:
+        c.generate_ligand_topology(bad, tempfile.mkdtemp())
+    except ValueError as exc:
+        assert "distinct" in str(exc).lower(), exc
+    else:
+        assert False, "a lone pair with coincident hosts was accepted"
+
+
+@test
+def regression_cgenff_duplicate_atom_name_is_refused():
+    """Two atoms sharing a name silently merge in every name-keyed map -- the
+    type table, the bond graph, coordinate matching -- so the parser refuses
+    it rather than emit a quietly-wrong topology."""
+    from . import cgenff as c
+    dup = _ETOH_STR.replace("ATOM H12 HGA3", "ATOM H11 HGA3")
+    try:
+        c.parse_stream(dup)
+    except ValueError as exc:
+        assert "duplicate" in str(exc).lower() and "H11" in str(exc), exc
+    else:
+        assert False, "a duplicate atom name was not refused"
+
+
+@test
+def regression_cgenff_bond_to_undeclared_atom_is_refused():
+    """A BOND (or IMPR/LONEPAIR) naming an atom with no ATOM record used to
+    surface as a bare KeyError deep in parameter resolution -- the bond loop
+    reads the atom's type before the graph's own guard runs. It must be one
+    clear error at parse time instead."""
+    from . import cgenff as c
+    bad = _ETOH_STR.replace("BOND C2 O1", "BOND C2 QQ")
+    try:
+        c.parse_stream(bad)
+    except ValueError as exc:
+        assert "QQ" in str(exc) and "ATOM record" in str(exc), exc
+    else:
+        assert False, "a bond to an undeclared atom was not refused"
+
+
+@test
+def reference_cgenff_flags_a_non_integer_net_charge():
+    """CGenFF partial charges sum to the formal (integer) charge; a net that is
+    not near an integer means a truncated or hand-edited stream. Reported in the
+    build, never refused."""
+    from . import cgenff as c
+    d = tempfile.mkdtemp()
+    ok = c.generate_ligand_topology(_ETOH_STR, os.path.join(d, "ok"))
+    assert ok["net_charge_is_integer"] and ok["charge_note"] is None, ok
+
+    unbalanced = _ETOH_STR.replace("ATOM O1  OG311  -0.650",
+                                   "ATOM O1  OG311  -0.600")
+    bad = c.generate_ligand_topology(unbalanced, os.path.join(d, "bad"))
+    assert bad["ok"] and not bad["net_charge_is_integer"], bad
+    assert "not close to an integer" in bad["charge_note"], bad
+    approx(bad["net_charge"], 0.05, 1e-6)
+
+
+@test
+def reference_cgenff_accepts_a_nonzero_integer_charge():
+    """A charged ligand (a carboxylate at -1, say) is normal. The integer-charge
+    check must accept it and flag only a *non*-integer net."""
+    from . import cgenff as c
+    charged = _ETOH_STR.replace("ATOM O1  OG311  -0.650",
+                                "ATOM O1  OG311  -1.650")
+    r = c.generate_ligand_topology(charged, tempfile.mkdtemp())
+    approx(r["net_charge"], -1.0, 1e-6)
+    assert r["net_charge_is_integer"] and r["charge_note"] is None, r
+
+
+@test
+def regression_cgenff_resname_cannot_escape_the_output_dir():
+    """A residue name is joined onto the output directory to make two filenames,
+    so an override of '../x' used to write outside it -- a path traversal that
+    matters most through the dashboard, where resname is a user field. It, and
+    anything with a separator, dot or space, must be refused."""
+    from . import cgenff as c
+    d = tempfile.mkdtemp()
+    for bad in ("../PWNED", "a/b", "..", "x.itp", "a b", "LIG."):
+        try:
+            c.generate_ligand_topology(_ETOH_STR, d, resname=bad)
+        except ValueError as exc:
+            assert "residue name" in str(exc), exc
+        else:
+            raise AssertionError("resname %r was accepted" % bad)
+    # a plain identifier is fine, and lands inside the output directory
+    rep = c.generate_ligand_topology(_ETOH_STR, d, resname="DRG1")
+    assert os.path.basename(rep["itp"]) == "DRG1.itp", rep
+    assert os.path.dirname(os.path.abspath(rep["itp"])) == os.path.abspath(d)
+
+
+@test
+def invariant_ring_dihedrals_and_pairs_are_deduped():
+    """A ring is where the graph enumeration earns its keep: a 1-4 pair is
+    reachable two ways round the ring (must dedup), one per central bond. Checked
+    on a benzene ring directly, so no force-field parameters are needed."""
+    from . import cgenff as c
+    names = ["C1", "C2", "C3", "C4", "C5", "C6"]
+    bonds = [("C1", "C2"), ("C2", "C3"), ("C3", "C4"),
+             ("C4", "C5"), ("C5", "C6"), ("C6", "C1")]
+
+    assert len(c.enumerate_angles(names, bonds)) == 6      # one per vertex
+    dih = c.enumerate_dihedrals(names, bonds)
+    assert len(dih) == 6, dih                              # one per ring bond
+    assert len({frozenset(q) for q in dih}) == 6, dih      # no repeated atom set
+
+    pairs = c.one_four_pairs(names, bonds, dih)
+    # the three para pairs, each found twice round the ring and deduped to one
+    assert {frozenset(p) for p in pairs} == {
+        frozenset(("C1", "C4")), frozenset(("C2", "C5")),
+        frozenset(("C3", "C6"))}, pairs
+
+
+@test
+def invariant_small_ring_excludes_a_1_4_that_is_also_1_3():
+    """In a five-ring a cross-ring pair is three bonds one way and two the other
+    -- a 1-4 AND a 1-3. It must NOT be emitted as a 1-4 pair, or it gets a
+    spurious scaled interaction on top of its 1-3 exclusion."""
+    from . import cgenff as c
+    names = ["A", "B", "C", "D", "E"]
+    bonds = [("A", "B"), ("B", "C"), ("C", "D"), ("D", "E"), ("E", "A")]
+    dih = c.enumerate_dihedrals(names, bonds)
+    assert c.one_four_pairs(names, bonds, dih) == []       # every pair is 1-2/1-3
+
+
+def _stub_cgenff(tmpdir, str_text=_ETOH_STR, fail=False, empty=False,
+                 output_flag=None):
+    """A fake `cgenff` that prints a known .str to stdout, the documented
+    behaviour of the real binary. The licensed program is not on this machine,
+    so what is testable is the plumbing around it: discovery, the command line,
+    capturing stdout, and the errors -- exactly as the pdb2gmx stub does.
+    With `output_flag` it instead writes the stream to the file named after that
+    flag, the way a build that does not use stdout would."""
+    tpl = os.path.join(tmpdir, "str_template.txt")
+    with open(tpl, "w") as fh:
+        fh.write(str_text)
+
+    if fail:
+        action = ("    sys.stderr.write('cgenff: cannot read molecule\\n')\n"
+                  "    sys.exit(1)\n")
+    elif empty:
+        action = "    sys.exit(0)\n"
+    elif output_flag:
+        action = ("    out = None\n"
+                  "    for i, x in enumerate(a):\n"
+                  "        if x == %r and i + 1 < len(a):\n"
+                  "            out = a[i + 1]\n"
+                  "    open(out, 'w').write(open(TPL).read())\n"
+                  "    sys.exit(0)\n" % output_flag)
+    else:
+        action = ("    sys.stdout.write(open(TPL).read())\n"
+                  "    sys.exit(0)\n")
+    py = os.path.join(tmpdir, "cgenff_stub.py")
+    with open(py, "w") as fh:
+        fh.write("import sys\nTPL = %r\na = sys.argv[1:]\n"
+                 "if True:\n" % tpl + action)
+
+    if os.name == "nt":
+        launcher = os.path.join(tmpdir, "cgenff.bat")
+        with open(launcher, "w") as fh:
+            fh.write('@echo off\r\n"%s" "%s" %%*\r\nexit /b %%ERRORLEVEL%%\r\n'
+                     % (sys.executable, py))
+    else:
+        launcher = os.path.join(tmpdir, "cgenff")
+        with open(launcher, "w") as fh:
+            fh.write('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, py))
+        os.chmod(launcher, 0o755)
+    return launcher
+
+
+@test
+def regression_cgenff_missing_binary_points_at_paramchem():
+    """The binary is licensed and optional. A missing one must say so clearly
+    AND name the licence-free alternative, not fail obscurely -- the .str entry
+    point needs no binary at all."""
+    from . import cgenff as c
+    try:
+        c.find_cgenff(cgenff=os.path.join(tempfile.mkdtemp(), "nope"))
+    except c.CGenFFNotFound as exc:
+        assert "nope" in str(exc), exc
+        assert "ParamChem" in str(exc), exc
+    else:
+        raise AssertionError("a missing cgenff binary was not reported")
+
+
+@test
+def endtoend_cgenff_binary_drives_the_converter():
+    """mol2 -> (stub) cgenff -> .str -> the same tested converter. The result
+    must be identical to feeding the .str directly, and the intermediate .str
+    kept alongside the topology."""
+    from . import cgenff as c
+    d = tempfile.mkdtemp()
+    stub = _stub_cgenff(d)
+    mol = os.path.join(d, "ligand.mol2")
+    with open(mol, "w") as fh:
+        fh.write("@<TRIPOS>MOLECULE\nethanol\n")
+
+    rep = c.generate_ligand_topology_from_molecule(
+        mol, os.path.join(d, "out"), cgenff=stub)
+    assert rep["ok"] and rep["resname"] == "ETOH", rep
+    assert rep["n_atoms"] == 9 and rep["n_angles"] == 13, rep
+    assert os.path.exists(rep["str"]), rep          # intermediate .str kept
+    # the produced topology loads through the package parser
+    mol_top = topology.parse_itp(rep["itp"])["ETOH"]
+    assert mol_top.natoms == 9, mol_top.natoms
+
+
+@test
+def regression_cgenff_binary_failure_and_silence_are_both_caught():
+    """Two ways the binary can betray a pipeline: a non-zero exit, and a zero
+    exit with no stream written. Both must raise, not produce an empty
+    topology."""
+    from . import cgenff as c
+    d = tempfile.mkdtemp()
+    mol = os.path.join(d, "ligand.mol2")
+    with open(mol, "w") as fh:
+        fh.write("@<TRIPOS>MOLECULE\nx\n")
+
+    failing = _stub_cgenff(d, fail=True)
+    try:
+        c.run_cgenff(mol, os.path.join(d, "a.str"), cgenff=failing)
+    except RuntimeError as exc:
+        assert "cgenff failed" in str(exc), exc
+    else:
+        raise AssertionError("a failing cgenff was swallowed")
+
+    silent = _stub_cgenff(d, empty=True)
+    try:
+        c.run_cgenff(mol, os.path.join(d, "b.str"), cgenff=silent)
+    except RuntimeError as exc:
+        assert "nothing to stdout" in str(exc), exc
+    else:
+        raise AssertionError("a silent cgenff was swallowed")
+
+
+@test
+def endtoend_cgenff_binary_that_writes_a_file_is_supported():
+    """Not every cgenff build writes to stdout; some take a flag naming an
+    output file. run_cgenff must drive that form -- `cgenff -f out mol` -- and
+    pick the .str up from the file, and still catch a build that writes none."""
+    from . import cgenff as c
+    d = tempfile.mkdtemp()
+    mol = os.path.join(d, "m.mol2")
+    with open(mol, "w") as fh:
+        fh.write("@<TRIPOS>MOLECULE\nethanol\n")
+
+    stub = _stub_cgenff(d, output_flag="-f")
+    out = os.path.join(d, "o.str")
+    c.run_cgenff(mol, out, cgenff=stub, output_flag="-f")
+    assert os.path.exists(out) and "ETOH" in open(out).read(), out
+
+    # a build that exits 0 but writes no file must still raise
+    silent = _stub_cgenff(d, empty=True)
+    try:
+        c.run_cgenff(mol, os.path.join(d, "none.str"), cgenff=silent,
+                     output_flag="-f")
+    except RuntimeError as exc:
+        assert "wrote no" in str(exc), exc
+    else:
+        raise AssertionError("a cgenff that wrote no output file was swallowed")
+
+
+@test
+def endtoend_cgenff_api_entry_takes_a_stream_and_validates_input():
+    """The flat api.generate_ligand_topology is the drivable surface -- it must
+    build from a .str written to disk, and reject the two obvious input
+    mistakes (neither source, or both) with a message that says what to pass."""
+    from .api import generate_ligand_topology as api_lig
+    d = tempfile.mkdtemp()
+    strp = os.path.join(d, "etoh.str")
+    with open(strp, "w") as fh:
+        fh.write(_ETOH_STR)
+
+    rep = api_lig({"str": strp, "output_dir": os.path.join(d, "out")})
+    assert rep["ok"] and rep["resname"] == "ETOH", rep
+
+    for bad in ({"output_dir": d},                       # neither source
+                {"str": strp, "molecule": "x.mol2",      # both sources
+                 "output_dir": d}):
+        try:
+            api_lig(bad)
+        except ValueError as exc:
+            assert "exactly one" in str(exc), exc
+        else:
+            raise AssertionError("ambiguous ligand input was accepted: %r" % bad)
+
+    # output_dir is required
+    try:
+        api_lig({"str": strp})
+    except ValueError as exc:
+        assert "output_dir" in str(exc), exc
+    else:
+        raise AssertionError("missing output_dir was accepted")
+
+
+# ---- ligand prep: PDB -> mol2 protonation (drives Open Babel) --------------
+
+# A protonated-ethanol mol2 the obabel stub "produces": 3 heavy atoms + 6 H.
+_ETOH_MOL2 = """\
+@<TRIPOS>MOLECULE
+ETOH
+ 9 8 0 0 0
+SMALL
+GASTEIGER
+@<TRIPOS>ATOM
+      1 C1   -0.700  0.000  0.000 C.3    1 LIG    -0.040
+      2 C2    0.700  0.000  0.000 C.3    1 LIG     0.140
+      3 O1    1.300  1.200  0.000 O.3    1 LIG    -0.400
+      4 H1   -1.100 -0.500  0.900 H      1 LIG     0.030
+      5 H2   -1.100 -0.500 -0.900 H      1 LIG     0.030
+      6 H3   -1.100  1.000  0.000 H      1 LIG     0.030
+      7 H4    1.100 -0.500  0.900 H      1 LIG     0.060
+      8 H5    1.100 -0.500 -0.900 H      1 LIG     0.060
+      9 HO    2.200  1.200  0.000 H      1 LIG     0.420
+@<TRIPOS>BOND
+     1    1    2 1
+     2    1    4 1
+     3    1    5 1
+     4    1    6 1
+     5    2    3 1
+     6    2    7 1
+     7    2    8 1
+     8    3    9 1
+"""
+
+# The input: ethanol heavy atoms only, no hydrogens (as a bare PDB often is).
+_ETOH_PDB = """\
+HETATM    1  C1  LIG     1      -0.700   0.000   0.000  1.00  0.00           C
+HETATM    2  C2  LIG     1       0.700   0.000   0.000  1.00  0.00           C
+HETATM    3  O1  LIG     1       1.300   1.200   0.000  1.00  0.00           O
+END
+"""
+
+
+def _stub_obabel(tmpdir, mol2_text=_ETOH_MOL2, fail=False, empty=False):
+    """A fake `obabel` that writes a known mol2 to its -O path, the way the real
+    tool does. Open Babel is not on this machine, so what is testable is the
+    plumbing: discovery, the -O/-p command line, and the two failure modes."""
+    tpl = os.path.join(tmpdir, "mol2_template.txt")
+    with open(tpl, "w") as fh:
+        fh.write(mol2_text)
+
+    if fail:
+        action = ("    sys.stderr.write('0 molecules converted\\n')\n"
+                  "    sys.exit(1)\n")
+    elif empty:
+        # exit 0 but write a molecule with no atom block (unreadable input)
+        action = ("    out and open(out, 'w').write('@<TRIPOS>MOLECULE\\nx\\n')\n"
+                  "    sys.exit(0)\n")
+    else:
+        action = ("    out and open(out, 'w').write(open(TPL).read())\n"
+                  "    sys.exit(0)\n")
+    py = os.path.join(tmpdir, "obabel_stub.py")
+    with open(py, "w") as fh:
+        fh.write("import sys\nTPL = %r\na = sys.argv[1:]\nout = None\n"
+                 "for i, x in enumerate(a):\n"
+                 "    if x == '-O' and i + 1 < len(a):\n        out = a[i + 1]\n"
+                 "if True:\n" % tpl + action)
+
+    if os.name == "nt":
+        launcher = os.path.join(tmpdir, "obabel.bat")
+        with open(launcher, "w") as fh:
+            fh.write('@echo off\r\n"%s" "%s" %%*\r\nexit /b %%ERRORLEVEL%%\r\n'
+                     % (sys.executable, py))
+    else:
+        launcher = os.path.join(tmpdir, "obabel")
+        with open(launcher, "w") as fh:
+            fh.write('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, py))
+        os.chmod(launcher, 0o755)
+    return launcher
+
+
+@test
+def endtoend_prep_pdb_to_mol2_protonates_at_ph7():
+    """The licence-free front end: a bare-heavy-atom PDB -> a protonated mol2.
+    The report must name the pH and count the hydrogens Open Babel added, so the
+    protonation choice is visible rather than buried."""
+    from . import prep
+    d = tempfile.mkdtemp()
+    pdb = os.path.join(d, "etoh.pdb")
+    with open(pdb, "w") as fh:
+        fh.write(_ETOH_PDB)
+    stub = _stub_obabel(d)
+    out = os.path.join(d, "etoh.mol2")
+
+    rep = prep.pdb_to_mol2(pdb, out, ph=7.0, obabel=stub)
+    assert rep["ok"] and os.path.exists(out), rep
+    approx(rep["ph"], 7.0, 1e-9)
+    assert rep["pdb_atoms"] == 3 and rep["mol2_atoms"] == 9, rep
+    assert rep["hydrogens_added"] == 6, rep
+
+
+@test
+def regression_prep_missing_obabel_is_reported():
+    """Open Babel is optional; a missing one must say what it tried and how to
+    get it, not fail obscurely deeper in the pipeline."""
+    from . import prep
+    try:
+        prep.find_obabel(obabel=os.path.join(tempfile.mkdtemp(), "nope"))
+    except prep.OpenBabelNotFound as exc:
+        assert "nope" in str(exc) and "openbabel" in str(exc).lower(), exc
+    else:
+        raise AssertionError("a missing obabel was not reported")
+
+
+@test
+def regression_prep_obabel_failure_and_empty_are_both_caught():
+    """Two ways obabel can betray the pipeline: a non-zero exit, and a zero exit
+    with an atomless mol2 (unreadable input). Both must raise, not hand back a
+    mol2 with no molecule in it."""
+    from . import prep
+    d = tempfile.mkdtemp()
+    pdb = os.path.join(d, "x.pdb")
+    with open(pdb, "w") as fh:
+        fh.write(_ETOH_PDB)
+
+    failing = _stub_obabel(d, fail=True)
+    try:
+        prep.pdb_to_mol2(pdb, os.path.join(d, "a.mol2"), obabel=failing)
+    except RuntimeError as exc:
+        assert "obabel failed" in str(exc), exc
+    else:
+        raise AssertionError("a failing obabel was swallowed")
+
+    empty = _stub_obabel(d, empty=True)
+    try:
+        prep.pdb_to_mol2(pdb, os.path.join(d, "b.mol2"), obabel=empty)
+    except RuntimeError as exc:
+        assert "no atoms" in str(exc), exc
+    else:
+        raise AssertionError("an atomless mol2 was accepted")
+
+
+@test
+def regression_prep_no_ph_conversion_omits_the_protonation():
+    """add_hydrogens=False converts a structure as it stands: the report records
+    no pH, and says so, rather than implying a protonation that did not happen."""
+    from . import prep
+    d = tempfile.mkdtemp()
+    pdb = os.path.join(d, "e.pdb")
+    with open(pdb, "w") as fh:
+        fh.write(_ETOH_PDB)
+    rep = prep.pdb_to_mol2(pdb, os.path.join(d, "o.mol2"),
+                           add_hydrogens=False, obabel=_stub_obabel(d))
+    assert rep["ok"] and rep["ph"] is None, rep
+    assert "as-is" in rep["note"], rep["note"]
+
+
+@test
+def endtoend_prep_pdb_all_the_way_to_topology():
+    """PDB -> (stub obabel) mol2 -> (stub cgenff) .str -> the tested converter.
+    The full-auto path chains both drivers; the result is the same topology the
+    .str route gives, with the mol2 kept and the pH recorded."""
+    from . import prep
+    d = tempfile.mkdtemp()
+    pdb = os.path.join(d, "etoh.pdb")
+    with open(pdb, "w") as fh:
+        fh.write(_ETOH_PDB)
+    obabel = _stub_obabel(d)
+    cgenff = _stub_cgenff(d)
+
+    rep = prep.generate_ligand_topology_from_pdb(
+        pdb, os.path.join(d, "out"), ph=7.0, obabel=obabel, cgenff=cgenff)
+    assert rep["ok"] and rep["resname"] == "ETOH", rep
+    assert rep["n_atoms"] == 9, rep
+    approx(rep["ph"], 7.0, 1e-9)
+    assert rep["hydrogens_added"] == 6, rep
+    assert os.path.exists(rep["mol2"]) and os.path.exists(rep["itp"]), rep
+
+
+@test
+def endtoend_cli_ligand_routes_str_and_mol2_subcommand_runs():
+    """The `ligand` positional routes on its extension (a .str is a stream) and
+    the new `mol2` subcommand drives Open Babel. Both are the drivable surface,
+    so both are exercised the way a shell would, JSON output and all."""
+    import contextlib
+    from . import __main__ as cli
+    d = tempfile.mkdtemp()
+
+    strp = os.path.join(d, "e.str")
+    with open(strp, "w") as fh:
+        fh.write(_ETOH_STR)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main(["ligand", strp, os.path.join(d, "out")])
+    assert rc == 0, buf.getvalue()
+    assert os.path.exists(os.path.join(d, "out", "ETOH.itp")), buf.getvalue()
+
+    pdb = os.path.join(d, "e.pdb")
+    with open(pdb, "w") as fh:
+        fh.write(_ETOH_PDB)
+    out_mol2 = os.path.join(d, "e.mol2")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main(["mol2", pdb, out_mol2, "--obabel", _stub_obabel(d)])
+    assert rc == 0, buf.getvalue()
+    assert os.path.exists(out_mol2), buf.getvalue()
+
+
+@test
+def endtoend_api_ligand_prep_surface():
+    """The flat api.prepare_mol2 and the 'pdb' route of generate_ligand_topology
+    are the no-licence front-end as an agent drives it. Both must run (tools
+    stubbed) and reject the obvious input mistakes."""
+    from . import api
+    d = tempfile.mkdtemp()
+    pdb = os.path.join(d, "e.pdb")
+    with open(pdb, "w") as fh:
+        fh.write(_ETOH_PDB)
+    obabel = _stub_obabel(d)
+
+    rep = api.prepare_mol2({"pdb": pdb, "output": os.path.join(d, "e.mol2"),
+                            "ph": 7.0, "obabel": obabel})
+    assert rep["ok"] and rep["ph"] == 7.0 and os.path.exists(rep["mol2"]), rep
+
+    for bad, needle in (({"pdb": pdb}, "required"),
+                        ({"pdb": pdb, "output": "x", "junk": 1}, "unknown")):
+        try:
+            api.prepare_mol2(bad)
+        except ValueError as exc:
+            assert needle in str(exc), exc
+        else:
+            raise AssertionError("prepare_mol2 accepted %r" % bad)
+
+    # the 'pdb' route: PDB -> (stub obabel) mol2 -> (stub cgenff) .str -> topology
+    r = api.generate_ligand_topology({
+        "pdb": pdb, "output_dir": os.path.join(d, "out"),
+        "obabel": obabel, "cgenff": _stub_cgenff(d)})
+    assert r["ok"] and r["resname"] == "ETOH", r
+    assert r["hydrogens_added"] == 6 and r["ph"] == 7.0, r
+
+
+@test
+def endtoend_ligand_batch_parameterises_a_directory():
+    """A whole directory of .str files in one call (one force-field read for the
+    batch). A broken stream fails without stopping the rest; the report lists
+    every result, each ok ligand in its own subdirectory. Input mistakes refuse."""
+    from . import api
+    d = tempfile.mkdtemp()
+    sdir = os.path.join(d, "streams")
+    os.makedirs(sdir)
+    for name, s in (("ethanol.str", _ETOH_STR), ("formaldehyde.str", _FALD_STR),
+                    ("broken.str", "read rtf card append\nRESI X 0\nGROUP\n"
+                                   "ATOM A CG331 0\nBOND A B\nEND\n")):
+        with open(os.path.join(sdir, name), "w") as fh:
+            fh.write(s)
+    r = api.generate_ligand_topologies({"dir": sdir,
+                                        "output_dir": os.path.join(d, "out")})
+    assert r["n_streams"] == 3 and r["n_ok"] == 2 and r["n_failed"] == 1, r
+    assert not r["ok"], r                          # one failed -> batch not ok
+    by = {os.path.basename(x["stream"]): x for x in r["results"]}
+    assert by["ethanol.str"]["ok"] and by["ethanol.str"]["resname"] == "ETOH"
+    assert not by["broken.str"]["ok"] and by["broken.str"]["error"]
+    assert os.path.exists(os.path.join(d, "out", "ethanol", "ETOH.itp"))
+
+    for bad, needle in (({"output_dir": "x"}, "exactly one"),
+                        ({"dir": sdir}, "output_dir"),
+                        ({"dir": sdir, "output_dir": "x", "junk": 1}, "unknown")):
+        try:
+            api.generate_ligand_topologies(bad)
+        except ValueError as exc:
+            assert needle in str(exc), (needle, exc)
+        else:
+            raise AssertionError("batch accepted %r" % bad)
+
+
+@test
+def endtoend_cli_place_routes_and_builds():
+    """The `place` subcommand drives placement from the shell and prints the
+    report as JSON -- the last of the ligand CLI surface."""
+    import contextlib
+    import json as _json
+    from . import __main__ as cli, cgenff
+    d = tempfile.mkdtemp()
+    sysd = _synthetic_protein_system(os.path.join(d, "system"))
+    ligd = os.path.join(d, "lig")
+    cgenff.generate_ligand_topology(_ETOH_STR, ligd)
+    pdb = os.path.join(d, "e.pdb")
+    _ethanol_pdb(pdb)
+    out = os.path.join(d, "placed")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main(["place", sysd, pdb, os.path.join(ligd, "ETOH.itp"), out])
+    assert rc == 0, buf.getvalue()
+    r = _json.loads(buf.getvalue())
+    assert r["ok"] and r["ligand"] == "ETOH", r
+    assert os.path.exists(os.path.join(out, "step5_input.gro"))
+
+
+# A REAL ParamChem stream (JZ4 / 2-propylphenol, the GROMACS protein-ligand
+# tutorial ligand, from Lemkul-Lab/cgenff_charmm2gmx tests/test_data/jz4.str).
+# It is here to keep the parser honest against real output, which differs from
+# the hand-built fixtures in two ways that matter: it has NO MASS records, and
+# its parameter sections carry only the one term CGenFF generated by analogy --
+# every standard bond/angle/dihedral comes from the base CGenFF force field,
+# which the stream does not include.
+_JZ4_STR = """\
+* Toppar stream file generated by
+* CHARMM General Force Field (CGenFF) program version 2.5
+*
+
+read rtf card append
+* Topologies generated by
+* CHARMM General Force Field (CGenFF) program version 2.5
+*
+36 1
+
+RESI JZ4            0.000 ! param penalty=   0.900 ; charge penalty=   0.468
+GROUP            ! CHARGE   CH_PENALTY
+ATOM C4     CG331  -0.275 !    0.319
+ATOM C7     CG2R61 -0.107 !    0.000
+ATOM C8     CG2R61 -0.114 !    0.000
+ATOM C9     CG2R61 -0.105 !    0.000
+ATOM C10    CG2R61  0.109 !    0.239
+ATOM C11    CG2R61 -0.117 !    0.000
+ATOM C12    CG2R61  0.001 !    0.365
+ATOM C13    CG321  -0.195 !    0.468
+ATOM C14    CG321  -0.176 !    0.342
+ATOM OAB    OG311  -0.531 !    0.262
+ATOM H1     HGA3    0.090 !    0.000
+ATOM H2     HGA3    0.090 !    0.000
+ATOM H3     HGA3    0.090 !    0.000
+ATOM H4     HGR61   0.115 !    0.000
+ATOM H5     HGR61   0.115 !    0.000
+ATOM H6     HGR61   0.115 !    0.000
+ATOM H7     HGR61   0.115 !    0.000
+ATOM H8     HGA2    0.090 !    0.000
+ATOM H9     HGA2    0.090 !    0.000
+ATOM H10    HGA2    0.090 !    0.000
+ATOM H11    HGA2    0.090 !    0.000
+ATOM H12    HGP1    0.420 !    0.000
+
+BOND C4   C14
+BOND C4   H1
+BOND C4   H2
+BOND C4   H3
+BOND C7   C8
+BOND C7   C11
+BOND C7   H4
+BOND C8   C9
+BOND C8   H5
+BOND C9   C10
+BOND C9   H6
+BOND C10  OAB
+BOND C10  C12
+BOND C11  C12
+BOND C11  H7
+BOND C12  C13
+BOND C13  C14
+BOND C13  H8
+BOND C13  H9
+BOND C14  H10
+BOND C14  H11
+BOND OAB  H12
+
+END
+
+read param card flex append
+* Parameters generated by analogy by
+* CHARMM General Force Field (CGenFF) program version 2.5
+*
+
+BONDS
+
+ANGLES
+
+DIHEDRALS
+CG2R61 CG321  CG321  CG331      0.0400  3     0.00 ! JZ4 , from CG2R61 CG321 CG321 CG321, penalty= 0.9
+
+IMPROPERS
+
+END
+RETURN
+"""
+
+
+@test
+def reference_cgenff_parses_a_real_paramchem_stream():
+    """Parse a real CGenFF stream, not a hand-built one. Two real-world facts
+    the fixtures did not have: no MASS records (mass inferred from the type
+    name), and near-empty parameter sections (the rest live in the base FF)."""
+    from . import cgenff as c
+    s = c.parse_stream(_JZ4_STR)
+    assert s.resname == "JZ4", s.resname
+    assert len(s.atoms) == 22 and len(s.bonds) == 22, (len(s.atoms), len(s.bonds))
+    assert s.atoms[0].name == "C4" and s.atoms[0].type == "CG331"
+    approx(s.atoms[0].charge, -0.275, 1e-9)
+    approx(s.atoms[0].charge_penalty, 0.319, 1e-9)     # read from the comment
+
+    # the stream has no masses; they are inferred from the CGenFF type names
+    assert len(s.masses) == 0, s.masses
+    approx(s.mass_of("CG331"), 12.011, 1e-6)
+    approx(s.mass_of("OG311"), 15.999, 1e-6)
+    approx(s.mass_of("HGA3"), 1.008, 1e-6)
+    approx(s.mass_of("CG2R61"), 12.011, 1e-6)
+
+    # only the single analogy-generated dihedral is present
+    assert len(s.bond_p) == 0 and len(s.angle_p) == 0 and len(s.impr_p) == 0, s
+    assert len(s.dihe_p) == 1, s.dihe_p
+    ((kchi, mult, delta, pen),) = s.dihe_p[("CG2R61", "CG321", "CG321", "CG331")]
+    approx(pen, 0.9, 1e-9)
+
+
+@test
+def regression_cgenff_non_self_contained_stream_is_diagnosed():
+    """A real stream cannot be converted yet -- most parameters are in the base
+    CGenFF FF, which the merge step (still to come) will read. The failure must
+    say exactly that, not imply the stream is broken."""
+    from . import cgenff as c
+    try:
+        c.generate_ligand_topology(_JZ4_STR, tempfile.mkdtemp())
+    except ValueError as exc:
+        msg = str(exc)
+        assert "supplement" in msg.lower(), msg
+        assert "top_all36_cgenff" in msg and "par_all36_cgenff" in msg, msg
+        # names a real missing term so the user can see what is meant
+        assert "CG2R61" in msg, msg
+    else:
+        raise AssertionError("a non-self-contained stream was converted anyway")
+
+
+@test
+def endtoend_cgenff_merges_missing_params_from_the_base_ff():
+    """A real stream carries only its atoms/bonds and the analogy params; the
+    rest come from the base CGenFF FF. A stream stripped to its RTF, plus a
+    small FF supplying the parameters, must build the same topology as the
+    self-contained stream did on its own."""
+    from . import cgenff as c
+    d = tempfile.mkdtemp()
+
+    # a stream with the parameters removed, like a real ParamChem one
+    rtf_half = _ETOH_STR.split("read param")[0]
+    stripped = (rtf_half + "read param card flex append\n"
+                "BONDS\nANGLES\nDIHEDRALS\nIMPROPERS\nNONBONDED\nEND\n")
+
+    # a tiny base FF: masses in an rtf, the parameters in a prm (reusing the
+    # very blocks the self-contained fixture carried inline)
+    rtf = os.path.join(d, "top_all36_cgenff.rtf")
+    with open(rtf, "w") as fh:
+        for t in ("CG331", "CG321"):
+            fh.write("MASS -1 %s 12.01100 C\n" % t)
+        fh.write("MASS -1 OG311 15.99940 O\n")
+        for t in ("HGA3", "HGA2", "HGP1"):
+            fh.write("MASS -1 %s 1.00800 H\n" % t)
+    prm = os.path.join(d, "par_all36_cgenff.prm")
+    with open(prm, "w") as fh:
+        fh.write("BONDS" + _ETOH_STR.split("BONDS", 1)[1])   # BONDS..END..RETURN
+
+    merged = c.generate_ligand_topology(stripped, os.path.join(d, "m"),
+                                        cgenff_ff=(rtf, prm))
+    whole = c.generate_ligand_topology(_ETOH_STR, os.path.join(d, "s"))
+
+    assert merged["base_ff_merged"] is True and whole["base_ff_merged"] is False
+    for k in ("n_atoms", "n_bonds", "n_angles", "n_dihedrals", "n_impropers"):
+        assert merged[k] == whole[k], (k, merged[k], whole[k])
+    approx(merged["net_charge"], 0.0, 1e-9)
+
+    # the two topologies are the same molecule, atom for atom and bond for bond
+    mm = topology.parse_itp(merged["itp"])["ETOH"]
+    ww = topology.parse_itp(whole["itp"])["ETOH"]
+    assert mm.atomname == ww.atomname and sorted(mm.bonds) == sorted(ww.bonds)
+    approx(mm.total_charge, 0.0, 1e-6)
+
+
+@test
+def invariant_cgenff_ff_is_cached_by_path_and_mtime():
+    """Parsing the base force field is the one real cost of a merge, and a whole
+    ligand library reuses one FF, so it is cached -- but keyed by mtime, so an
+    edited file is re-read and the cache never goes stale."""
+    from . import cgenff as c
+    d = tempfile.mkdtemp()
+    rtf = os.path.join(d, "top_all36_cgenff.rtf")
+    prm = os.path.join(d, "par_all36_cgenff.prm")
+    with open(rtf, "w") as fh:
+        fh.write("MASS -1 CG331 12.011 C\n")
+    with open(prm, "w") as fh:
+        fh.write("BONDS\nCG331 CG331 200 1.5\n")
+    try:
+        a = c.load_cgenff_ff(d)
+        assert c.load_cgenff_ff(d) is a             # cache hit: same object
+        os.utime(prm, (time.time() + 5, time.time() + 5))   # edit -> newer mtime
+        assert c.load_cgenff_ff(d) is not a         # re-read, not stale
+    finally:
+        c.clear_ff_cache()
+
+
+@test
+def reference_cgenff_jz4_matches_the_gold_standard():
+    """The acceptance test. The real JZ4 stream, merged over the base CGenFF FF,
+    must reproduce the topology CHARMM-GUI's Ligand Reader / Lemkul's reference
+    converter gives -- count for count (validated section-for-section once, and
+    locked in here so the converter cannot drift off it). The base FF is
+    MacKerell material and not shipped, so point LAMELLYX_CGENFF_FF at a toppar/
+    that has top_all36_cgenff.rtf + par_all36_cgenff.prm; without it this skips.
+    """
+    from . import cgenff as c
+    ff = os.environ.get("LAMELLYX_CGENFF_FF")
+    if not ff or not os.path.isdir(ff):
+        raise SkipTest("set LAMELLYX_CGENFF_FF to a toppar/ with "
+                       "top_all36_cgenff.rtf + par_all36_cgenff.prm")
+    d = tempfile.mkdtemp()
+    rep = c.generate_ligand_topology(_JZ4_STR, d, cgenff_ff=ff)
+    assert (rep["n_atoms"], rep["n_bonds"], rep["n_angles"],
+            rep["n_dihedrals"], rep["n_impropers"]) == (22, 22, 37, 50, 0), rep
+    approx(rep["net_charge"], 0.0, 1e-6)
+    assert rep["net_charge_is_integer"], rep
+    # 47 one-four pairs, matching the reference converter
+    npairs = len(_section_lines(
+        open(os.path.join(d, "JZ4.itp")).read(), "pairs"))
+    assert npairs == 47, npairs
+
+
+@test
+def endtoend_cgenff_missing_base_ff_file_is_reported():
+    """Point the merge at a directory without the CGenFF files and it must say
+    which file it wanted and what it is, not fail obscurely."""
+    from . import cgenff as c
+    try:
+        c.load_cgenff_ff(tempfile.mkdtemp())
+    except FileNotFoundError as exc:
+        assert "top_all36_cgenff.rtf" in str(exc) or "par_all36" in str(exc), exc
+        assert "CHARMM-GUI" in str(exc), exc
+    else:
+        raise AssertionError("a missing base CGenFF file was not reported")
+
+
+# --- ligand placement ------------------------------------------------------
+
+def _mini_itp(path, name, natoms):
+    """A minimal, parseable per-molecule .itp: n atoms in a bonded chain, all
+    neutral so the system's net charge is easy to reason about."""
+    lines = ["[ moleculetype ]", "%s 3" % name, "", "[ atoms ]"]
+    for i in range(1, natoms + 1):
+        lines.append("%5d %5s %5d %5s %5s %5d %8.3f %8.3f"
+                     % (i, "CT", 1, name, "A%d" % i, i, 0.0, 12.011))
+    lines += ["", "[ bonds ]"]
+    for i in range(1, natoms):
+        lines.append("%5d %5d 1" % (i, i + 1))
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def _write_forcefield(path, extra_atomtypes=""):
+    with open(path, "w") as fh:
+        fh.write("[ defaults ]\n1 2 yes 1.0 1.0\n\n[ atomtypes ]\n"
+                 "    CT 6 12.011 0.0 A 3.5e-01 2.7e-01\n" + extra_atomtypes)
+
+
+def _synthetic_protein_system(d, extra_atomtypes=""):
+    """A tiny but structurally real built system: 1 protein (3 atoms), 2 lipids
+    (5 each), 4 waters (3 each) = 25 atoms, written with the package's own
+    writers so it has the same shape a real build does."""
+    os.makedirs(d)
+    toppar = os.path.join(d, "toppar")
+    os.makedirs(toppar)
+    _write_forcefield(os.path.join(toppar, "forcefield.itp"), extra_atomtypes)
+    _mini_itp(os.path.join(toppar, "PROA.itp"), "PROA", 3)
+    _mini_itp(os.path.join(toppar, "LIP.itp"), "LIP", 5)
+    _mini_itp(os.path.join(toppar, "SOL.itp"), "SOL", 3)
+
+    rng = np.random.default_rng(1)
+    xyz = rng.uniform(5.0, 20.0, (25, 3))     # Angstrom, all in one corner
+    names = np.array(["A%d" % ((i % 5) + 1) for i in range(25)], dtype="<U6")
+    resn = np.array(["PROA"] * 3 + ["LIP"] * 10 + ["SOL"] * 12, dtype="<U6")
+    resid = np.array([1, 1, 1] + [2, 2, 2, 2, 2, 3, 3, 3, 3, 3]
+                     + [4, 4, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7], dtype=np.int64)
+    atoms = fileio.Atoms(names, resn, resid, xyz)
+    fileio.write_gro(os.path.join(d, "step5_input.gro"), atoms,
+                     np.array([50.0, 50.0, 50.0]))
+    topology.write_index(os.path.join(d, "index.ndx"),
+                         topology.standard_groups(25, slice(0, 3),
+                                                  slice(3, 13), slice(13, 25)))
+    topology.write_topol(os.path.join(d, "topol.top"),
+                         ["PROA.itp", "LIP.itp", "SOL.itp"],
+                         [("PROA", 1), ("LIP", 2), ("SOL", 4)])
+    return d
+
+
+def _ethanol_pdb(path):
+    """Ethanol atoms in DELIBERATELY scrambled order (reversed), placed away
+    from the synthetic system, so the placer's reordering is actually tested."""
+    order = ["C1", "H11", "H12", "H13", "C2", "H21", "H22", "O1", "HO1"]
+    scrambled = list(reversed(order))
+    xyz = np.array([[28.0 + 1.2 * i, 30.0, 30.0] for i in range(9)])
+    atoms = fileio.Atoms(scrambled, ["ETOH"] * 9, [1] * 9, xyz)
+    fileio.write_pdb(path, atoms, box=np.array([50.0, 50.0, 50.0]))
+
+
+@test
+def endtoend_ligand_placed_into_a_protein_system():
+    """The whole placement path: convert ethanol, place a positioned PDB, and
+    check every book stays balanced -- atom order matched to the .itp, counts
+    and index groups consistent, the ligand inside SOLU, new atom types added
+    exactly once."""
+    from . import cgenff, ligand
+    d = tempfile.mkdtemp()
+    sysd = _synthetic_protein_system(os.path.join(d, "system"))
+    ligd = os.path.join(d, "lig")
+    cgenff.generate_ligand_topology(_ETOH_STR, ligd)
+    pdb = os.path.join(d, "ethanol.pdb")
+    _ethanol_pdb(pdb)
+
+    out = os.path.join(d, "system_lig")
+    rep = ligand.add_ligand(sysd, pdb, os.path.join(ligd, "ETOH.itp"), out)
+    assert rep["ok"] and rep["ligand"] == "ETOH", rep
+    assert rep["ligand_atoms"] == 9 and rep["atom_total"] == 34, rep
+    approx(rep["net_charge"], 0.0, 1e-6)
+    assert set(rep["atomtypes_added"]) == {
+        "CG331", "CG321", "OG311", "HGA3", "HGA2", "HGP1"}, rep["atomtypes_added"]
+
+    # [ molecules ] gained ETOH right after the protein, before the lipid
+    assert rep["molecules"] == [("PROA", 1), ("ETOH", 1), ("LIP", 2),
+                                ("SOL", 4)], rep["molecules"]
+
+    # the .gro: ligand atoms sit at 3..11, in the .itp order, not the PDB order
+    new_atoms, _ = fileio.read_gro(os.path.join(out, "step5_input.gro"))
+    assert len(new_atoms) == 34
+    lig_names = list(new_atoms.name[3:12])
+    assert lig_names == ["C1", "H11", "H12", "H13", "C2", "H21", "H22",
+                         "O1", "HO1"], lig_names
+
+    # the index groups still cover every atom exactly once, and SOLU grew by 9
+    idx = ligand.parse_index(os.path.join(out, "index.ndx"))
+    assert len(idx["SOLU"]) == 12, len(idx["SOLU"])          # 3 protein + 9
+    assert len(idx["MEMB"]) == 10 and len(idx["SOLV"]) == 12, idx
+    covered = len(idx["SOLU"]) + len(idx["MEMB"]) + len(idx["SOLV"])
+    assert covered == 34, covered
+
+    # topol.top: the atom types are #included before any moleculetype
+    with open(os.path.join(out, "topol.top")) as fh:
+        top = fh.read()
+    assert "ETOH_atomtypes.itp" in top and "ETOH.itp" in top, top
+    assert top.index("ETOH_atomtypes.itp") < top.index("ETOH.itp"), \
+        "atom types must be included before the moleculetype that uses them"
+    # and the placer copied the ligand files into the new toppar
+    assert os.path.exists(os.path.join(out, "toppar", "ETOH.itp"))
+    assert rep["closest_ligand_contact_A"] > 0.0, rep
+
+
+@test
+def endtoend_ligand_placed_into_a_multi_protein_system():
+    """CJ's channels are tetramers, so the solute is several protein chains. The
+    ligand must insert after ALL of them (the end of SOLU), before the membrane,
+    and every book still balance."""
+    from . import cgenff, ligand
+    d = tempfile.mkdtemp()
+    sysd = os.path.join(d, "sys")
+    os.makedirs(sysd)
+    toppar = os.path.join(sysd, "toppar")
+    os.makedirs(toppar)
+    _write_forcefield(os.path.join(toppar, "forcefield.itp"))
+    for nm in ("PROA", "PROB"):
+        _mini_itp(os.path.join(toppar, nm + ".itp"), nm, 3)
+    _mini_itp(os.path.join(toppar, "LIP.itp"), "LIP", 5)
+    _mini_itp(os.path.join(toppar, "SOL.itp"), "SOL", 3)
+    rng = np.random.default_rng(2)
+    xyz = rng.uniform(5.0, 20.0, (28, 3))
+    names = np.array(["A%d" % ((i % 5) + 1) for i in range(28)], dtype="<U6")
+    resn = np.array(["PROA"] * 3 + ["PROB"] * 3 + ["LIP"] * 10 + ["SOL"] * 12,
+                    dtype="<U6")
+    resid = np.array([1, 1, 1, 2, 2, 2] + [3, 3, 3, 3, 3, 4, 4, 4, 4, 4]
+                     + [5, 5, 5, 6, 6, 6, 7, 7, 7, 8, 8, 8], dtype=np.int64)
+    fileio.write_gro(os.path.join(sysd, "step5_input.gro"),
+                     fileio.Atoms(names, resn, resid, xyz),
+                     np.array([50.0, 50.0, 50.0]))
+    topology.write_index(os.path.join(sysd, "index.ndx"),
+                         topology.standard_groups(28, slice(0, 6),
+                                                  slice(6, 16), slice(16, 28)))
+    topology.write_topol(os.path.join(sysd, "topol.top"),
+                         ["PROA.itp", "PROB.itp", "LIP.itp", "SOL.itp"],
+                         [("PROA", 1), ("PROB", 1), ("LIP", 2), ("SOL", 4)])
+
+    ligd = os.path.join(d, "lig")
+    cgenff.generate_ligand_topology(_ETOH_STR, ligd)
+    pdb = os.path.join(d, "e.pdb")
+    _ethanol_pdb(pdb)
+    rep = ligand.add_ligand(sysd, pdb, os.path.join(ligd, "ETOH.itp"),
+                            os.path.join(d, "out"))
+    assert rep["molecules"] == [("PROA", 1), ("PROB", 1), ("ETOH", 1),
+                                ("LIP", 2), ("SOL", 4)], rep["molecules"]
+    idx = ligand.parse_index(os.path.join(d, "out", "index.ndx"))
+    assert len(idx["SOLU"]) == 15, idx           # 6 protein + 9 ligand
+    assert len(idx["SOLU"]) + len(idx["MEMB"]) + len(idx["SOLV"]) == 37
+    g, _ = fileio.read_gro(os.path.join(d, "out", "step5_input.gro"))
+    assert list(g.name[6:15]) == ["C1", "H11", "H12", "H13", "C2", "H21",
+                                  "H22", "O1", "HO1"], list(g.name[6:15])
+
+
+@test
+def regression_topology_parse_itp_malformed_line_is_clean():
+    """A short [ atoms ] row used to crash parse_itp with a bare IndexError,
+    deep in a build or a placement. It must be a clear ValueError naming the
+    section and the file, since parse_itp underpins both v1 and v2."""
+    from . import topology
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "bad.itp")
+    with open(p, "w") as fh:                          # [atoms] row missing cols
+        fh.write("[ moleculetype ]\nLIG 3\n[ atoms ]\n1 CT 1\n")
+    try:
+        topology.parse_itp(p)
+    except ValueError as exc:
+        assert "atoms" in str(exc) and "bad.itp" in str(exc), exc
+    else:
+        raise AssertionError("a malformed .itp line was parsed without error")
+
+
+@test
+def endtoend_ligand_with_a_lone_pair_is_placed():
+    """A halogenated ligand has a lone pair -- a virtual site in the .itp that a
+    docked PDB never contains. Placement must reconstruct its coordinate from
+    the host atoms, not demand it, or a halogen drug cannot be placed at all."""
+    from . import cgenff, ligand
+    d = tempfile.mkdtemp()
+    sysd = _synthetic_protein_system(os.path.join(d, "system"))
+    ligd = os.path.join(d, "lig")
+    cgenff.generate_ligand_topology(_CLM_STR, ligd)     # CLM.itp carries LP1
+
+    # a realistic docked PDB: the five real atoms, no virtual LP1
+    real = ["C1", "H1", "H2", "H3", "CL1"]
+    xyz = np.array([[28.0, 30, 30], [29, 30.9, 30], [29, 29.1, 30.6],
+                    [29, 29.1, 29.4], [26.3, 30, 30]])
+    pdb = os.path.join(d, "clm.pdb")
+    fileio.write_pdb(pdb, fileio.Atoms(real, ["CLM"] * 5, [1] * 5, xyz),
+                     box=np.array([50.0, 50.0, 50.0]))
+
+    out = os.path.join(d, "sys_clm")
+    rep = ligand.add_ligand(sysd, pdb, os.path.join(ligd, "CLM.itp"), out)
+    assert rep["ok"] and rep["ligand_atoms"] == 6, rep       # 5 real + the LP
+    assert rep["lone_pairs_reconstructed"] == ["LP1"], rep
+    approx(rep["net_charge"], 0.0, 1e-6)
+
+    # the LP lands at the sigma hole: 1.5 A off Cl, on the far side from C
+    g, _ = fileio.read_gro(os.path.join(out, "step5_input.gro"))
+    names = list(g.name[3:9])
+    assert "LP1" in names, names
+    lp, cl = g.xyz[3:9][names.index("LP1")], g.xyz[3:9][names.index("CL1")]
+    approx(float(np.linalg.norm(lp - cl)), 1.5, 1e-3)        # |a| = 0.15 nm
+    assert lp[0] < cl[0], (lp, cl)                           # away from C1 at x=28
+
+    # bookkeeping still balances with the extra virtual atom in place
+    idx = ligand.parse_index(os.path.join(out, "index.ndx"))
+    assert len(idx["SOLU"]) == 9, idx                        # 3 protein + 6
+    covered = len(idx["SOLU"]) + len(idx["MEMB"]) + len(idx["SOLV"])
+    assert covered == len(g) == 31, (covered, len(g))
+
+
+@test
+def regression_lone_pair_with_a_missing_host_is_refused():
+    """Reconstructing a lone pair needs its host atoms. A PDB missing one must
+    be refused by name, not fail obscurely in the geometry."""
+    from . import cgenff, ligand
+    d = tempfile.mkdtemp()
+    sysd = _synthetic_protein_system(os.path.join(d, "system"))
+    ligd = os.path.join(d, "lig")
+    cgenff.generate_ligand_topology(_CLM_STR, ligd)
+    # a PDB missing CL1 (a host of LP1), and LP1 itself
+    real = ["C1", "H1", "H2", "H3"]
+    xyz = np.array([[28.0, 30, 30], [29, 30.9, 30], [29, 29.1, 30.6],
+                    [29, 29.1, 29.4]])
+    pdb = os.path.join(d, "clm.pdb")
+    fileio.write_pdb(pdb, fileio.Atoms(real, ["CLM"] * 4, [1] * 4, xyz),
+                     box=np.array([50.0, 50.0, 50.0]))
+    try:
+        ligand.add_ligand(sysd, pdb, os.path.join(ligd, "CLM.itp"),
+                          os.path.join(d, "out"))
+    except ValueError as exc:
+        assert "lone pair" in str(exc).lower() and "CL1" in str(exc), exc
+    else:
+        assert False, "a lone pair with a missing host was not refused"
+
+
+@test
+def regression_place_malformed_ligand_itp_is_refused_cleanly():
+    """A malformed ligand .itp used to reach the placer and crash inside the
+    topology parser with a bare IndexError -- uncaught by the CLI, so a
+    traceback. It must be one clear ValueError instead."""
+    from . import ligand
+    d = tempfile.mkdtemp()
+    sysd = _synthetic_protein_system(os.path.join(d, "system"))
+    itp = os.path.join(d, "bad.itp")
+    with open(itp, "w") as fh:                       # [atoms] row missing columns
+        fh.write("[ moleculetype ]\nLIG 3\n[ atoms ]\n1\n[ bonds ]\n")
+    at = os.path.join(d, "bad_atomtypes.itp")
+    with open(at, "w") as fh:
+        fh.write("[ atomtypes ]\n")
+    pdb = os.path.join(d, "l.pdb")
+    fileio.write_pdb(pdb, fileio.Atoms(["C1"], ["LIG"], [1], np.zeros((1, 3))),
+                     box=np.array([50.0, 50.0, 50.0]))
+    try:
+        ligand.add_ligand(sysd, pdb, itp, os.path.join(d, "out"),
+                          atomtypes_itp=at)
+    except ValueError as exc:
+        assert "ligand .itp" in str(exc), exc
+    else:
+        raise AssertionError("a malformed ligand .itp was accepted")
+
+
+@test
+def regression_place_refuses_a_name_colliding_with_a_system_molecule():
+    """A ligand whose moleculetype matches a system molecule (naming it 'LIP'
+    into a system that has LIP) would overwrite that molecule's .itp and list
+    the name twice in [ molecules ] -- silent corruption. Refuse it."""
+    from . import cgenff, ligand
+    d = tempfile.mkdtemp()
+    sysd = _synthetic_protein_system(os.path.join(d, "system"))    # has LIP
+    ligd = os.path.join(d, "lig")
+    cgenff.generate_ligand_topology(_ETOH_STR, ligd, resname="LIP")
+    pdb = os.path.join(d, "l.pdb")
+    _ethanol_pdb(pdb)                    # refused before atom matching anyway
+    try:
+        ligand.add_ligand(sysd, pdb, os.path.join(ligd, "LIP.itp"),
+                          os.path.join(d, "out"))
+    except ValueError as exc:
+        assert "already names a molecule" in str(exc), exc
+    else:
+        raise AssertionError("a colliding ligand name was accepted")
+
+
+@test
+def regression_place_resname_labels_the_residue_not_the_moleculetype():
+    """--resname overrides the ligand's RESIDUE name (a coordinate label), not
+    its moleculetype. [ molecules ] must still name the moleculetype from the
+    .itp, or grompp finds no matching [ moleculetype ]."""
+    from . import cgenff, ligand
+    d = tempfile.mkdtemp()
+    sysd = _synthetic_protein_system(os.path.join(d, "system"))
+    ligd = os.path.join(d, "lig")
+    cgenff.generate_ligand_topology(_ETOH_STR, ligd)               # type ETOH
+    pdb = os.path.join(d, "l.pdb")
+    _ethanol_pdb(pdb)
+    out = os.path.join(d, "out")
+    rep = ligand.add_ligand(sysd, pdb, os.path.join(ligd, "ETOH.itp"), out,
+                            resname="DRG")
+    names = [m[0] for m in rep["molecules"]]
+    assert "ETOH" in names and "DRG" not in names, rep["molecules"]
+    g, _ = fileio.read_gro(os.path.join(out, "step5_input.gro"))
+    assert set(g.resname[3:12]) == {"DRG"}, set(g.resname[3:12])
+
+
+@test
+def endtoend_two_lone_pairs_convert_and_place():
+    """A dihalogen carries two lone pairs, so the vsite/exclusion emission and
+    the placement reconstruction each run more than once. Both sites must come
+    out with distinct hosts, both massless, and both rebuilt at placement."""
+    from . import cgenff, ligand
+    dbm = "\n".join([
+        "* dibromomethane", "*", "read rtf card append", "* t", "*", "36 1",
+        "MASS -1 CG321 12.01100", "MASS -1 HGA2 1.00800",
+        "MASS -1 BRGA2 79.90400", "RESI DBM 0.000", "GROUP",
+        "ATOM C1 CG321 -0.200", "ATOM H1 HGA2 0.100", "ATOM H2 HGA2 0.100",
+        "ATOM BR1 BRGA2 -0.050", "ATOM BR2 BRGA2 -0.050",
+        "ATOM LP1 LPH 0.050", "ATOM LP2 LPH 0.050",
+        "BOND C1 H1", "BOND C1 H2", "BOND C1 BR1", "BOND C1 BR2",
+        "LONEPAIR COLINEAR LP1 BR1 C1 DIST 1.6000 SCALE 0.0",
+        "LONEPAIR COLINEAR LP2 BR2 C1 DIST 1.6000 SCALE 0.0", "END",
+        "read param card flex append", "* p", "*",
+        "BONDS", "CG321 HGA2 309.00 1.1110", "CG321 BRGA2 220.00 1.9500",
+        "ANGLES", "HGA2 CG321 HGA2 35.50 109.00",
+        "HGA2 CG321 BRGA2 32.00 107.00", "BRGA2 CG321 BRGA2 40.00 112.00",
+        "DIHEDRALS", "IMPROPERS", "NONBONDED", "CG321 0.0 -0.0560 2.0100",
+        "HGA2 0.0 -0.0280 1.3400", "BRGA2 0.0 -0.4800 2.0700", "END"])
+    d = tempfile.mkdtemp()
+    rep = cgenff.generate_ligand_topology(dbm, os.path.join(d, "lig"))
+    assert rep["n_atoms"] == 7 and rep["n_lonepairs"] == 2, rep
+    approx(rep["net_charge"], 0.0, 1e-9)
+
+    itp = open(os.path.join(d, "lig", "DBM.itp")).read()
+    vs = _section_lines(itp, "virtual_sites2")
+    assert len(vs) == 2, vs
+    assert {v.split()[1] for v in vs} == {"4", "5"}, vs      # hosts BR1, BR2
+    assert len(_section_lines(itp, "exclusions")) == 2, itp
+    for a in _section_lines(itp, "atoms"):
+        if a.split()[4] in ("LP1", "LP2"):
+            approx(float(a.split()[7]), 0.0, 1e-12)          # massless
+
+    sysd = _synthetic_protein_system(os.path.join(d, "sys"))
+    real = ["C1", "H1", "H2", "BR1", "BR2"]
+    xyz = np.array([[30.0, 30, 30], [31, 31, 30], [31, 29, 30],
+                    [27.5, 30, 30], [32.5, 30, 30]])
+    pdb = os.path.join(d, "dbm.pdb")
+    fileio.write_pdb(pdb, fileio.Atoms(real, ["DBM"] * 5, [1] * 5, xyz),
+                     box=np.array([60.0, 60, 60]))
+    pr = ligand.add_ligand(sysd, pdb, os.path.join(d, "lig", "DBM.itp"),
+                          os.path.join(d, "out"))
+    assert pr["ligand_atoms"] == 7, pr
+    assert pr["lone_pairs_reconstructed"] == ["LP1", "LP2"], pr
+
+
+@test
+def reference_cgenff_lone_pair_on_a_ring_excludes_through_the_ring():
+    """A halogen on an aromatic ring routes its lone pair's exclusions around the
+    ring: the LP must be excluded from the ipso carbon (1-2), the two ortho
+    carbons (1-3), and -- the subtle part -- the two meta carbons AND the two
+    ortho hydrogens (both 1-4, the H reached C-C-H). Getting that ring-borne 1-4
+    set right is the point of the test."""
+    from . import cgenff as c
+    clb = """\
+* chlorobenzene with a chlorine lone pair
+*
+read rtf card append
+* top
+*
+36 1
+MASS -1 CG2R61 12.01100
+MASS -1 HGR61   1.00800
+MASS -1 CLGA1  35.45000
+RESI CLB 0.000
+GROUP
+ATOM C1 CG2R61  0.000
+ATOM C2 CG2R61 -0.115
+ATOM C3 CG2R61 -0.115
+ATOM C4 CG2R61 -0.115
+ATOM C5 CG2R61 -0.115
+ATOM C6 CG2R61 -0.115
+ATOM H2 HGR61   0.115
+ATOM H3 HGR61   0.115
+ATOM H4 HGR61   0.115
+ATOM H5 HGR61   0.115
+ATOM H6 HGR61   0.115
+ATOM CL1 CLGA1 -0.170
+ATOM LP1 LPH    0.170
+BOND C1 C2  C2 C3  C3 C4  C4 C5  C5 C6  C6 C1
+BOND C2 H2  C3 H3  C4 H4  C5 H5  C6 H6
+BOND C1 CL1
+LONEPAIR COLINEAR LP1 CL1 C1 DIST 1.6000 SCALE 0.0
+END
+read param card flex append
+* par
+*
+BONDS
+CG2R61 CG2R61 305.00 1.3750
+CG2R61 HGR61  340.00 1.0800
+CG2R61 CLGA1  240.00 1.7400
+ANGLES
+CG2R61 CG2R61 CG2R61 40.00 120.00
+CG2R61 CG2R61 HGR61  30.00 120.00
+CG2R61 CG2R61 CLGA1  45.00 120.00
+DIHEDRALS
+X CG2R61 CG2R61 X 3.1000 2 180.00
+NONBONDED
+CG2R61 0.0 -0.0700 1.9924
+HGR61  0.0 -0.0300 1.3582
+CLGA1  0.0 -0.3430 1.9100
+END
+"""
+    d = tempfile.mkdtemp()
+    rep = c.generate_ligand_topology(clb, d)
+    assert rep["n_atoms"] == 13 and rep["n_lonepairs"] == 1, rep
+    approx(rep["net_charge"], 0.0, 1e-9)
+    assert rep["net_charge_is_integer"], rep
+
+    ex = _section_lines(open(os.path.join(d, "CLB.itp")).read(), "exclusions")
+    assert len(ex) == 1, ex
+    got = set(int(x) for x in ex[0].split()[1:])
+    # LP=13; CL1=12 (host), C1=1 (ipso 1-2), C2=2 & C6=6 (ortho 1-3),
+    # C3=3 & C5=5 (meta 1-4), H2=7 & H6=11 (ortho hydrogens, 1-4)
+    assert got == {1, 2, 3, 5, 6, 7, 11, 12}, sorted(got)
+
+
+@test
+def regression_ligand_pdb_that_disagrees_with_topology_is_refused():
+    """A PDB missing an atom the .itp needs, or carrying an extra one, is the
+    exact topology/coordinate mismatch the package exists to catch -- it must
+    be refused with the offending atoms named, not placed with a hole."""
+    from . import cgenff, ligand
+    d = tempfile.mkdtemp()
+    sysd = _synthetic_protein_system(os.path.join(d, "system"))
+    ligd = os.path.join(d, "lig")
+    cgenff.generate_ligand_topology(_ETOH_STR, ligd)
+
+    # a PDB with one hydrogen dropped
+    order = ["C1", "H11", "H12", "C2", "H21", "H22", "O1", "HO1"]   # no H13
+    xyz = np.array([[28.0 + 1.2 * i, 30.0, 30.0] for i in range(len(order))])
+    pdb = os.path.join(d, "bad.pdb")
+    fileio.write_pdb(pdb, fileio.Atoms(order, ["ETOH"] * len(order),
+                                       [1] * len(order), xyz))
+    try:
+        ligand.add_ligand(sysd, pdb, os.path.join(ligd, "ETOH.itp"),
+                          os.path.join(d, "out"))
+    except ValueError as exc:
+        assert "H13" in str(exc) and "missing" in str(exc).lower(), exc
+    else:
+        raise AssertionError("a ligand PDB missing an atom was placed anyway")
+
+
+@test
+def regression_ligand_atomtype_collision_is_handled():
+    """A ligand type the force field already defines must be dropped if it is
+    identical (no duplicate definition, which grompp rejects) and must RAISE if
+    it differs (a silent parameter swap otherwise)."""
+    from . import cgenff, ligand
+    d = tempfile.mkdtemp()
+    ligd = os.path.join(d, "lig")
+    cgenff.generate_ligand_topology(_ETOH_STR, ligd)
+    pdb = os.path.join(d, "ethanol.pdb")
+    _ethanol_pdb(pdb)
+
+    # read the exact CG331 line the converter wrote, and seed the force field
+    # with it -- an identical prior definition, which must be dropped
+    with open(os.path.join(ligd, "ETOH_atomtypes.itp")) as fh:
+        cg331 = [ln for ln in fh if ln.split()[:1] == ["CG331"]][0].strip()
+    same = _synthetic_protein_system(os.path.join(d, "sys_same"),
+                                     extra_atomtypes=cg331 + "\n")
+    rep = ligand.add_ligand(same, pdb, os.path.join(ligd, "ETOH.itp"),
+                            os.path.join(d, "out_same"))
+    assert "CG331" in rep["atomtypes_already_present"], rep
+    assert "CG331" not in rep["atomtypes_added"], rep
+
+    # now the same type with a DIFFERENT sigma -- a real conflict, must raise
+    diff = _synthetic_protein_system(
+        os.path.join(d, "sys_diff"),
+        extra_atomtypes="CG331 6 12.011 0.0 A 9.9e-01 9.9e-01\n")
+    try:
+        ligand.add_ligand(diff, pdb, os.path.join(ligd, "ETOH.itp"),
+                          os.path.join(d, "out_diff"))
+    except ValueError as exc:
+        assert "CG331" in str(exc) and "different" in str(exc).lower(), exc
+    else:
+        raise AssertionError("a conflicting atom type redefinition was allowed")
+
+
+@test
+def regression_place_drops_pairtypes_the_force_field_already_has():
+    """A ligand's _atomtypes.itp carries a [ pairtypes ] entry for every pair of
+    its types. Placed into a system whose force field already gives some of
+    those pairs (a CGenFF ligand into a CGenFF-aware system), the duplicates
+    must be dropped -- writing a pair type twice is a grompp override warning.
+    New pairs are kept; an atom-type conflict still refuses."""
+    from . import ligand
+    d = tempfile.mkdtemp()
+    lig_at = os.path.join(d, "L_atomtypes.itp")
+    with open(lig_at, "w") as fh:
+        fh.write("[ atomtypes ]\n"
+                 " CG331 6 12.011 0.0 A 3.6e-01 3.3e-01\n"
+                 " OG311 8 15.999 0.0 A 3.1e-01 4.0e-01\n"
+                 "[ pairtypes ]\n"
+                 " CG331 CG331 1 3.4e-01 4.2e-02\n"       # FF already has this
+                 " CG331 OG311 1 3.2e-01 4.5e-02\n")      # new -> keep
+    out = os.path.join(d, "out_atomtypes.itp")
+    existing_at = {"CG331": "CG331 6 12.011 0.0 A 3.6e-01 3.3e-01"}   # identical
+    kept, dropped = ligand._dedup_atomtypes(
+        lig_at, existing_at, {("CG331", "CG331")}, out)
+    assert dropped == ["CG331"], dropped
+    assert [ln.split()[0] for ln in kept] == ["OG311"], kept
+    pairs = [tuple(sorted(l.split()[:2]))
+             for l in _section_lines(open(out).read(), "pairtypes")]
+    assert ("CG331", "CG331") not in pairs, pairs         # dropped (FF has it)
+    assert ("CG331", "OG311") in pairs, pairs             # new -> kept
+
+
+@test
+def regression_ligand_atomtype_dedup_tolerates_float_formatting():
+    """A system force field can carry the ligand's CGenFF atom types with
+    coarser float formatting (0.36349 vs the converter's 3.634867e-01) -- the
+    SAME type, not a redefinition. The dedup compares numerically, so it drops
+    it rather than refusing a valid placement, while a genuinely different
+    parameter still conflicts."""
+    from . import ligand
+    d = tempfile.mkdtemp()
+    lig = os.path.join(d, "L_atomtypes.itp")
+    with open(lig, "w") as fh:
+        fh.write("[ atomtypes ]\n"
+                 " CG331 6 12.011 0.0 A 3.634867e-01 3.263520e-01\n")
+    out = os.path.join(d, "out.itp")
+    same = {"CG331": "CG331 6 12.011 0.0 A 0.36349 0.32635"}   # coarser format
+    kept, dropped = ligand._dedup_atomtypes(lig, same, set(), out)
+    assert dropped == ["CG331"] and kept == [], (dropped, kept)
+
+    diff = {"CG331": "CG331 6 12.011 0.0 A 0.99 0.99"}         # real difference
+    try:
+        ligand._dedup_atomtypes(lig, diff, set(), out)
+    except ValueError as exc:
+        assert "CG331" in str(exc) and "different" in str(exc).lower(), exc
+    else:
+        raise AssertionError("a genuinely different atom type was not flagged")
+
+
+@test
+def endtoend_place_ligand_api_entry_builds_and_validates():
+    """The flat api.place_ligand is the drivable surface for placement -- it
+    must build from a real system + ligand and reject a missing required key
+    with a message that names it."""
+    from . import cgenff
+    from .api import place_ligand
+    d = tempfile.mkdtemp()
+    sysd = _synthetic_protein_system(os.path.join(d, "system"))
+    ligd = os.path.join(d, "lig")
+    cgenff.generate_ligand_topology(_ETOH_STR, ligd)
+    pdb = os.path.join(d, "ethanol.pdb")
+    _ethanol_pdb(pdb)
+
+    rep = place_ligand({"system_dir": sysd, "ligand_pdb": pdb,
+                        "ligand_itp": os.path.join(ligd, "ETOH.itp"),
+                        "output_dir": os.path.join(d, "out")})
+    assert rep["ok"] and rep["atom_total"] == 34, rep
+
+    try:
+        place_ligand({"system_dir": sysd, "ligand_pdb": pdb,
+                     "output_dir": os.path.join(d, "out2")})   # no ligand_itp
+    except ValueError as exc:
+        assert "ligand_itp" in str(exc), exc
+    else:
+        raise AssertionError("a missing required key was accepted")
+
+
+@test
+def endtoend_check_system_catches_topology_coordinate_mismatch():
+    """check_system is the pre-grompp sanity pass: a good system validates, and
+    a coordinate file that has lost atoms is caught as a count mismatch against
+    [ molecules ] and the index -- the exact failure the package exists to
+    prevent, reported before a cluster run."""
+    from . import cgenff, ligand, api
+    d = tempfile.mkdtemp()
+    sysd = _synthetic_protein_system(os.path.join(d, "sys"))
+    r0 = api.check_system({"system_dir": sysd})
+    assert r0["ok"] and r0["atoms"] == 25, r0
+    assert r0["index_checked"] == "SOLU+MEMB+SOLV" and r0["next_command"], r0
+
+    ligd = os.path.join(d, "lig")
+    cgenff.generate_ligand_topology(_ETOH_STR, ligd)
+    pdb = os.path.join(d, "e.pdb")
+    _ethanol_pdb(pdb)
+    out = os.path.join(d, "out")
+    ligand.add_ligand(sysd, pdb, os.path.join(ligd, "ETOH.itp"), out)
+    assert api.check_system({"system_dir": out})["ok"], "placed system failed"
+
+    # drop two atoms from the .gro; the mismatch must be caught, not slip through
+    gro = os.path.join(out, "step5_input.gro")
+    lines = open(gro).read().splitlines()
+    lines[1] = str(int(lines[1]) - 2)
+    del lines[2:4]
+    with open(gro, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    bad = api.check_system({"system_dir": out})
+    assert not bad["ok"], bad
+    assert any("32" in e and "34" in e for e in bad["errors"]), bad["errors"]
+
+    # a missing directory, and an unknown setting, are clean errors
+    try:
+        api.check_system({"system_dir": os.path.join(d, "nope")})
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("a missing system dir was accepted")
+    try:
+        api.check_system({"system_dir": sysd, "junk": 1})
+    except ValueError as exc:
+        assert "unknown" in str(exc), exc
+    else:
+        raise AssertionError("an unknown setting was accepted")
+
+
+@test
+def endtoend_full_ligand_workflow():
+    """The whole v2 journey in one test: a CGenFF stream -> a ligand topology ->
+    placed into a protein+membrane system -> validated grompp-ready. If any seam
+    between the three pieces drifts, this catches it, and it doubles as an
+    executable statement of the workflow."""
+    from . import cgenff, ligand, api
+    d = tempfile.mkdtemp()
+
+    # 1. topology from a CGenFF stream
+    ligd = os.path.join(d, "lig")
+    rep = cgenff.generate_ligand_topology(_ETOH_STR, ligd)
+    assert rep["ok"] and rep["net_charge_is_integer"], rep
+
+    # 2. place the positioned ligand into a built system
+    sysd = _synthetic_protein_system(os.path.join(d, "sys"))
+    pdb = os.path.join(d, "e.pdb")
+    _ethanol_pdb(pdb)
+    out = os.path.join(d, "out")
+    place = ligand.add_ligand(sysd, pdb, os.path.join(ligd, "ETOH.itp"), out)
+    assert place["ok"], place
+
+    # 3. the result validates as grompp-shaped, and the counts agree end to end
+    cs = api.check_system({"system_dir": out})
+    assert cs["ok"] and not cs["errors"], cs
+    assert cs["atoms"] == place["atom_total"], (cs["atoms"], place["atom_total"])
+    assert cs["next_command"] and "grompp" in cs["next_command"], cs
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("-k", help="only run tests whose name contains this")
@@ -1703,7 +3929,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     chosen = [t for t in TESTS if not args.k or args.k in t.__name__]
-    failures = []
+    failures, skipped = [], []
     t0 = time.time()
     for t in chosen:
         start = time.time()
@@ -1713,6 +3939,10 @@ def main(argv=None):
             t()
             sys.stdout = old
             print("  pass  %-58s %5.2fs" % (t.__name__, time.time() - start))
+        except SkipTest as exc:
+            sys.stdout = old
+            print("  skip  %-58s (%s)" % (t.__name__, exc))
+            skipped.append(t.__name__)
         except Exception as exc:                        # noqa: BLE001
             sys.stdout = old
             print("  FAIL  %-58s %5.2fs" % (t.__name__, time.time() - start))
@@ -1720,8 +3950,10 @@ def main(argv=None):
         finally:
             sys.stdout = old
 
-    print("\n%d of %d passed in %.1fs" % (len(chosen) - len(failures),
-                                          len(chosen), time.time() - t0))
+    print("\n%d of %d passed%s in %.1fs"
+          % (len(chosen) - len(failures) - len(skipped), len(chosen),
+             (", %d skipped" % len(skipped)) if skipped else "",
+             time.time() - t0))
     for name, exc, tb in failures:
         print("\n" + "=" * 72)
         print("FAIL %s\n  %s: %s" % (name, type(exc).__name__, exc))

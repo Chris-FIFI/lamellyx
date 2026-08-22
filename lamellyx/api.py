@@ -309,6 +309,273 @@ def generate_protein_topology(settings):
                                   settings["output_dir"], **kw)
 
 
+def generate_ligand_topology(settings):
+    """Make a ligand's GROMACS topology from CGenFF. Two ways in:
+
+        {"str": "ligand.str", "output_dir": "lig"}         # from ParamChem
+        {"molecule": "ligand.mol2", "output_dir": "lig"}   # drive the binary
+
+    The `str` route needs no licence and no binary -- paste the molecule into
+    the ParamChem web server, download the stream, pass it here. The `molecule`
+    route drives the licensed cgenff program on a mol2/sdf, the same way
+    `generate_protein_topology` drives pdb2gmx; it needs a CGenFF licence.
+
+    Either way this does not invent parameters -- CGenFF assigns them and this
+    converts them. A real stream is only a supplement to the base CGenFF force
+    field, so pass `cgenff_ff` -- a directory with top_all36_cgenff.rtf and
+    par_all36_cgenff.prm (any CHARMM-GUI toppar/ has them) -- and they are
+    merged in. The CGenFF penalty is reported, never refused; `penalty_flag`
+    optionally lists every parameter above a number you choose.
+
+    Optional: `resname`, `cgenff_ff`, `penalty_flag`, and (molecule route only)
+    `cgenff` (path to the binary), `output_flag`, `extra_args`.
+    """
+    from . import cgenff as _c
+
+    settings = dict(settings or {})
+    if not settings.get("output_dir"):
+        raise ValueError("output_dir is required")
+    src = settings.get("str") or settings.get("stream")
+    mol = settings.get("molecule")
+    pdb = settings.get("pdb")
+    if sum(bool(x) for x in (src, mol, pdb)) != 1:
+        raise ValueError(
+            "give exactly one of 'str' (a ParamChem stream file), 'molecule' "
+            "(a mol2/sdf for the cgenff binary), or 'pdb' (protonated to mol2 "
+            "by Open Babel, then the binary)")
+
+    accepted = {"str", "stream", "molecule", "pdb", "ph", "obabel",
+                "output_dir", "resname", "cgenff_ff", "penalty_flag", "cgenff",
+                "output_flag", "extra_args"}
+    unknown = sorted(set(settings) - accepted)
+    if unknown:
+        raise ValueError("unknown settings: %s. Accepted: %s"
+                         % (", ".join(unknown), ", ".join(sorted(accepted))))
+
+    common = {"resname": settings.get("resname"),
+              "cgenff_ff": settings.get("cgenff_ff"),
+              "penalty_flag": settings.get("penalty_flag")}
+    if src:
+        return _c.generate_ligand_topology(src, settings["output_dir"], **common)
+    if pdb:
+        from . import prep as _p
+        return _p.generate_ligand_topology_from_pdb(
+            pdb, settings["output_dir"], ph=settings.get("ph", 7.0),
+            obabel=settings.get("obabel"), cgenff=settings.get("cgenff"),
+            output_flag=settings.get("output_flag"),
+            extra_args=tuple(settings.get("extra_args", ())), **common)
+    return _c.generate_ligand_topology_from_molecule(
+        mol, settings["output_dir"], cgenff=settings.get("cgenff"),
+        output_flag=settings.get("output_flag"),
+        extra_args=tuple(settings.get("extra_args", ())), **common)
+
+
+def generate_ligand_topologies(settings):
+    """Parameterise a whole directory (or list) of CGenFF streams in one call.
+
+        {"dir": "streams", "output_dir": "topologies",
+         "cgenff_ff": "charmm-gui-1234/gromacs/toppar"}
+
+    The base CGenFF force field is parsed once and cached across the batch, so a
+    library of a hundred ligands is one ~0.2 s force-field read plus a hundred
+    fast conversions -- not a hundred re-reads, which is what a shell loop over
+    `lamellyx ligand` does (each a fresh process, cache cold every time). Each
+    stream's output lands in its own subdirectory named after the file. One
+    stream failing does not stop the rest; the report lists every result and
+    every failure. Optional: `cgenff_ff`, `penalty_flag`.
+    """
+    from . import cgenff as _c
+
+    settings = dict(settings or {})
+    out_dir = settings.get("output_dir")
+    if not out_dir:
+        raise ValueError("output_dir is required")
+    streams = settings.get("streams")
+    directory = settings.get("dir")
+    if bool(streams) == bool(directory):
+        raise ValueError("give exactly one of 'dir' (a directory of .str files) "
+                         "or 'streams' (a list of .str paths)")
+    accepted = {"dir", "streams", "output_dir", "cgenff_ff", "penalty_flag"}
+    unknown = sorted(set(settings) - accepted)
+    if unknown:
+        raise ValueError("unknown settings: %s. Accepted: %s"
+                         % (", ".join(unknown), ", ".join(sorted(accepted))))
+    if directory:
+        if not os.path.isdir(directory):
+            raise FileNotFoundError("not a directory: %s" % directory)
+        streams = sorted(os.path.join(directory, f)
+                         for f in os.listdir(directory)
+                         if f.lower().endswith(".str"))
+        if not streams:
+            raise ValueError("no .str files in %s" % directory)
+
+    ff = settings.get("cgenff_ff")
+    pf = settings.get("penalty_flag")
+    results = []
+    for s in streams:
+        stem = os.path.splitext(os.path.basename(s))[0]
+        sub = os.path.join(out_dir, stem)
+        try:
+            rep = _c.generate_ligand_topology(s, sub, cgenff_ff=ff,
+                                              penalty_flag=pf)
+            results.append({"stream": s, "ok": True, "resname": rep["resname"],
+                            "output_dir": sub, "n_atoms": rep["n_atoms"],
+                            "net_charge": rep["net_charge"],
+                            "net_charge_is_integer": rep["net_charge_is_integer"],
+                            "worst_penalty": rep["worst_penalty"]})
+        except (ValueError, FileNotFoundError) as exc:
+            results.append({"stream": s, "ok": False, "error": str(exc)})
+    n_ok = sum(1 for r in results if r["ok"])
+    return {
+        "ok": n_ok == len(results),
+        "n_streams": len(results),
+        "n_ok": n_ok,
+        "n_failed": len(results) - n_ok,
+        "results": results,
+    }
+
+
+def prepare_mol2(settings):
+    """Protonate a ligand PDB and write a ParamChem-ready mol2. No licence.
+
+        {"pdb": "ligand.pdb", "output": "ligand.mol2", "ph": 7.0}
+
+    Drives Open Babel to add the hydrogens appropriate for `ph` (default 7.0)
+    and convert to mol2 -- the file the ParamChem web server reads. The report
+    names the pH and how many hydrogens were added, so the protonation choice is
+    visible. Take the mol2 to cgenff.silcsbio.com for a .str, then
+    `generate_ligand_topology({"str": ...})`. Optional: `obabel` (path),
+    `add_hydrogens` (False to convert an already-protonated PDB as-is).
+    """
+    from . import prep as _p
+
+    settings = dict(settings or {})
+    for need in ("pdb", "output"):
+        if not settings.get(need):
+            raise ValueError("%s is required" % need)
+    accepted = {"pdb", "output", "ph", "obabel", "add_hydrogens", "extra_args"}
+    unknown = sorted(set(settings) - accepted)
+    if unknown:
+        raise ValueError("unknown settings: %s. Accepted: %s"
+                         % (", ".join(unknown), ", ".join(sorted(accepted))))
+    return _p.pdb_to_mol2(
+        settings["pdb"], settings["output"], ph=settings.get("ph", 7.0),
+        obabel=settings.get("obabel"),
+        add_hydrogens=settings.get("add_hydrogens", True),
+        extra_args=tuple(settings.get("extra_args", ())))
+
+
+def place_ligand(settings):
+    """Put a positioned ligand into a built protein system.
+
+        {"system_dir": "hcn4_box", "ligand_pdb": "drug_docked.pdb",
+         "ligand_itp": "lig/DRG.itp", "output_dir": "hcn4_drug"}
+
+    `system_dir` is a built system (step5_input.gro, topol.top, index.ndx,
+    toppar/); `ligand_pdb` the ligand already positioned in the same frame.
+    Coordinates are the caller's -- nothing here docks. It matches the PDB to
+    the .itp atom order, splices the ligand into the solute group, extends the
+    topology and index, and deduplicates atom types against the force field.
+    `atomtypes_itp` defaults to <ligand_itp stem>_atomtypes.itp.
+    """
+    from . import ligand as _lig
+
+    settings = dict(settings or {})
+    for need in ("system_dir", "ligand_pdb", "ligand_itp", "output_dir"):
+        if not settings.get(need):
+            raise ValueError("%s is required" % need)
+    accepted = {"system_dir", "ligand_pdb", "ligand_itp", "output_dir",
+                "atomtypes_itp", "resname"}
+    unknown = sorted(set(settings) - accepted)
+    if unknown:
+        raise ValueError("unknown settings: %s. Accepted: %s"
+                         % (", ".join(unknown), ", ".join(sorted(accepted))))
+    return _lig.add_ligand(
+        settings["system_dir"], settings["ligand_pdb"], settings["ligand_itp"],
+        settings["output_dir"], atomtypes_itp=settings.get("atomtypes_itp"),
+        resname=settings.get("resname"))
+
+
+def check_system(settings):
+    """Structurally check a built system before gmx grompp.
+
+        {"system_dir": "hcn4_drug"}
+
+    Verifies that [ molecules ] and the coordinates agree on the atom count,
+    that every molecule named has a topology in toppar/, that the SOLU/MEMB/SOLV
+    index groups partition every atom exactly once, and that the net charge is
+    (near) an integer. This is the pre-grompp sanity pass the whole package's
+    invariants are arranged around -- it does not replace grompp, but catches
+    the "topology and coordinates disagree" mismatch grompp would, before a
+    cluster run. Returns {ok, errors, warnings, atoms, molecules, net_charge}.
+    """
+    from . import topology, fileio, ligand as _lig
+
+    settings = dict(settings or {})
+    d = settings.get("system_dir")
+    if not d:
+        raise ValueError("system_dir is required")
+    unknown = sorted(set(settings) - {"system_dir"})
+    if unknown:
+        raise ValueError("unknown settings: %s. Accepted: system_dir"
+                         % ", ".join(unknown))
+    for need in ("topol.top", "step5_input.gro", "toppar"):
+        if not os.path.exists(os.path.join(d, need)):
+            raise FileNotFoundError("%s not found in %s" % (need, d))
+
+    errors, warnings = [], []
+    _, molecules = _lig.parse_topol(os.path.join(d, "topol.top"))
+    tops = topology.load_toppar(os.path.join(d, "toppar"))
+    atoms, _box = fileio.read_gro(os.path.join(d, "step5_input.gro"))
+
+    expect, net = 0, 0.0
+    for name, count in molecules:
+        if name not in tops:
+            errors.append("molecule %r in topol.top has no .itp in toppar/"
+                          % name)
+            continue
+        expect += count * tops[name].natoms
+        net += count * tops[name].total_charge
+    if expect and expect != len(atoms):
+        errors.append("topol.top implies %d atoms but step5_input.gro has %d"
+                      % (expect, len(atoms)))
+
+    index_checked = None
+    idxpath = os.path.join(d, "index.ndx")
+    if os.path.exists(idxpath):
+        idx = _lig.parse_index(idxpath)
+        partition = [g for g in ("SOLU", "MEMB", "SOLV") if g in idx]
+        if partition:
+            members = [i for g in partition for i in idx[g]]
+            if len(members) != len(atoms):
+                errors.append("index groups %s cover %d atoms but the system "
+                              "has %d" % ("+".join(partition), len(members),
+                                          len(atoms)))
+            if len(set(members)) != len(members):
+                errors.append("index groups %s overlap -- an atom is in more "
+                              "than one" % "+".join(partition))
+            index_checked = "+".join(partition)
+
+    if abs(net - round(net)) > 0.01:
+        warnings.append("net charge %.4f is not near an integer -- the system "
+                        "may not be neutralised" % net)
+
+    return {
+        "ok": not errors,
+        "system_dir": os.path.abspath(d),
+        "atoms": len(atoms),
+        "molecules": molecules,
+        "net_charge": round(net, 4) + 0.0,
+        "index_checked": index_checked,
+        "errors": errors,
+        "warnings": warnings,
+        "next_command": (
+            "gmx grompp -f step6.0_minimization.mdp -c step5_input.gro -r "
+            "step5_input.gro -p topol.top -n index.ndx -o min.tpr"
+            if not errors else None),
+    }
+
+
 def orient_protein(settings):
     """Put a protein into the membrane frame and write it out.
 

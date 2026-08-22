@@ -154,17 +154,17 @@ def write_series(directory, temperature=310, membrane_only=False):
     os.makedirs(directory, exist_ok=True)
     written = []
     p = os.path.join(directory, "step6.0_minimization.mdp")
-    with open(p, "w") as fh:
+    with open(p, "w", newline="\n") as fh:
         fh.write(minimisation())
     written.append(p)
     for name, bb, sc, lip, dih, dt, nsteps, baro, gv in _SCHEDULE:
         p = os.path.join(directory, name + ".mdp")
-        with open(p, "w") as fh:
+        with open(p, "w", newline="\n") as fh:
             fh.write(_md(bb, sc, lip, dih, dt, nsteps, baro, gv, temperature,
                          membrane_only=membrane_only))
         written.append(p)
     p = os.path.join(directory, "step7_production.mdp")
-    with open(p, "w") as fh:
+    with open(p, "w", newline="\n") as fh:
         fh.write(production(T=temperature, membrane_only=membrane_only))
     written.append(p)
     return written

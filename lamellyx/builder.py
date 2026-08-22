@@ -702,7 +702,7 @@ def write_output(cfg, res, blocks, mols, lipid_top, water_top,
     files += [os.path.join(out, f) for f in mdp.MDP_FILES]
 
     p = os.path.join(out, "build_report.json")
-    with open(p, "w") as fh:
+    with open(p, "w", newline="\n") as fh:
         json.dump({"config": {k: (list(v) if isinstance(v, tuple) else v)
                               for k, v in asdict(cfg).items()},
                    "counts": res.counts,

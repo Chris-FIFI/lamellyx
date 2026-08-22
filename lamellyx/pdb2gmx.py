@@ -188,7 +188,7 @@ def generate_topology(protein_pdb, out_dir, forcefield="charmm36-jul2022",
                 lines[i] = line.replace(bits[0], new, 1)
                 break
         path = os.path.join(toppar, new + ".itp")
-        with open(path, "w") as fh:
+        with open(path, "w", newline="\n") as fh:
             fh.write("; renamed from %s by lamellyx.pdb2gmx\n" % old)
             fh.write("\n".join(lines) + "\n")
         written.append(path)

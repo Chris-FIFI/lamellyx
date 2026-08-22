@@ -146,7 +146,7 @@ def read_pdb(path, keep_hetatm=True, keep_altloc_first=True):
 
 def write_pdb(path, atoms, box=None, title="built by lamellyx"):
     """Write a PDB. Atom and residue numbers wrap, as the format requires."""
-    with open(path, "w") as fh:
+    with open(path, "w", newline="\n") as fh:
         fh.write(f"REMARK    {title}\n")
         if box is not None:
             fh.write("CRYST1%9.3f%9.3f%9.3f%7.2f%7.2f%7.2f P 1           1\n"
@@ -204,7 +204,7 @@ def write_gro(path, atoms, box, title="built by lamellyx"):
         append(fmt((resid[i], atoms.resname[i][:5], atoms.name[i][:5],
                     (i + 1) % 100000, xyz[i, 0], xyz[i, 1], xyz[i, 2])))
     append("%10.5f%10.5f%10.5f" % (box[0] / 10.0, box[1] / 10.0, box[2] / 10.0))
-    with open(path, "w") as fh:
+    with open(path, "w", newline="\n") as fh:
         fh.write("\n".join(out) + "\n")
 
 
