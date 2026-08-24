@@ -40,7 +40,7 @@ gmx mdrun -deffnm min
 
 ## Install
 
-**This is not on PyPI — `pip install lamellyx` will fail.** It is a private
+**This is not on PyPI — `pip install lamellyx` will fail.** It is a public
 GitHub repository. Clone it and install from the clone:
 
 ```bash
@@ -54,6 +54,11 @@ python -m lamellyx setup <a CHARMM-GUI gromacs directory>
 reinstall — drop the `-e` for a plain install. If you already have the files
 (e.g. from an archive), skip the clone and run `pip install -e .` from inside
 the folder.
+
+> **Old pip?** Editable installs (`-e`) from a `pyproject.toml` need pip ≥ 21.3;
+> older pip stops with *"editable mode currently requires a setuptools-based
+> build"*. Either drop the `-e` and run a plain **`pip install .`**, or upgrade
+> first with `python -m pip install --upgrade pip setuptools`.
 
 > If pip warns that `lamellyx.exe` is not on PATH, ignore it and use
 > **`python -m lamellyx …`** instead of the bare `lamellyx` command — it always
