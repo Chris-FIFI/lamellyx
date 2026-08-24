@@ -12,7 +12,7 @@ Install from a clone:
 git clone https://github.com/Chris-FIFI/lamellyx.git
 cd lamellyx
 pip install -e .
-python -m lamellyx setup <a CHARMM-GUI gromacs directory>
+python -m lamellyx setup /path/to/charmm-gui-1234/gromacs   # a real path, not the <angle brackets>
 ```
 
 Requires Python 3.9+ and numpy. Nothing else. No GROMACS needed to *build* —

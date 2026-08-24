@@ -47,7 +47,7 @@ GitHub repository. Clone it and install from the clone:
 git clone https://github.com/Chris-FIFI/lamellyx.git
 cd lamellyx
 pip install -e .
-python -m lamellyx setup <a CHARMM-GUI gromacs directory>
+python -m lamellyx setup /path/to/charmm-gui-1234/gromacs   # a real path, not the <angle brackets>
 ```
 
 `-e` installs it editable, so a `git pull` updates the package with no
@@ -226,9 +226,17 @@ coordinates; nothing here docks. (Building the membrane *around* a bound ligand,
 so lipids never pack into it, is designed in [docs/ligand-in-build.md] but not
 yet built.)
 
-All of this is on the **dashboard** too, under the *Ligand topology* tab. A
-runnable walkthrough that needs no setup is
-[`examples/ligand_topology.py`](examples/ligand_topology.py).
+All of this is on the **dashboard** too, under the *Ligand topology* tab. To try
+it in one command with no setup, convert the bundled sample stream:
+
+```bash
+python -m lamellyx ligand examples/chloromethane.str out
+```
+
+See [`examples/`](examples/README.md) for a short guided walkthrough and
+exercises (that sample, a lone-pair virtual site, the penalty filter, and how to
+bring your own molecule), plus [`examples/ligand_topology.py`](examples/ligand_topology.py)
+for the same through the Python API.
 
 For a **library**, `lamellyx ligand-batch streams/ topologies/ --ff .../toppar`
 converts a whole directory of streams in one call, reading the base force field

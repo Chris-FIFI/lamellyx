@@ -1,0 +1,54 @@
+* Toppar stream file for chloromethane (CH3Cl) -- a lamellyx example ligand.
+* Self-contained: every parameter it needs is inline, so it converts with NO
+* base force field. A real ParamChem stream instead references the base CGenFF
+* FF, and you pass that with --ff <a toppar/ directory>.
+*
+
+read rtf card append
+* Topologies
+*
+36 1
+
+MASS -1 CG331   12.01100 ! aliphatic C for CH3
+MASS -1 HGA3     1.00800 ! aliphatic H, CH3
+MASS -1 CLGA1   35.45000 ! aliphatic chlorine
+
+RESI CLM    0.000
+GROUP
+ATOM C1  CG331  -0.070 !   0.000
+ATOM H1  HGA3    0.090 !   0.000
+ATOM H2  HGA3    0.090 !   0.000
+ATOM H3  HGA3    0.090 !   0.000
+ATOM CL1 CLGA1  -0.290 !   0.000
+ATOM LP1 LPH     0.090 !   0.000
+BOND C1 H1
+BOND C1 H2
+BOND C1 H3
+BOND C1 CL1
+LONEPAIR COLINEAR LP1 CL1 C1 DIST 1.5000 SCALE 0.0
+
+END
+
+read param card flex append
+* Parameters
+*
+
+BONDS
+CG331 HGA3    322.00   1.1110 ! penalty= 0.0
+CG331 CLGA1   222.00   1.7760 ! penalty= 5.0
+
+ANGLES
+HGA3 CG331 HGA3    35.50   108.40 ! penalty= 0.0
+HGA3 CG331 CLGA1   34.00   108.00 ! penalty= 0.0
+
+DIHEDRALS
+
+IMPROPERS
+
+NONBONDED nbxmod 5 atom cdiel
+CG331   0.0  -0.0780   2.0500
+HGA3    0.0  -0.0240   1.3400
+CLGA1   0.0  -0.3430   1.9100
+
+END
+RETURN
